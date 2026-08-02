@@ -7,6 +7,7 @@ import html
 import random
 import json
 import aiohttp
+from datetime import datetime, timedelta
 
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
@@ -86,9 +87,14 @@ def load_scraper_state(uid: int) -> dict:
         if os.path.exists(SCRAPER_STATE_FILE):
             with open(SCRAPER_STATE_FILE, "r") as f:
                 data = json.load(f)
-                return data.get(str(uid), {"channel": None, "start_msg_id": 1, "progress_msg_id": None})
+                state = data.get(str(uid), {})
+                # Migrate old format if needed
+                if "targets" not in state: state["targets"] = []
+                if "auto_run" not in state: state["auto_run"] = False
+                if "last_run" not in state: state["last_run"] = 0
+                return state
     except: pass
-    return {"channel": None, "start_msg_id": 1, "progress_msg_id": None}
+    return {"targets": [], "auto_run": False, "last_run": 0}
 
 def save_scraper_state(uid: int, state: dict):
     try:
@@ -183,11 +189,11 @@ def parse_link(link: str) -> tuple[bool, str]:
 async def fast_http_link_check(link: str) -> str:
     """Super fast check to instantly flag dead links without delaying"""
     link = link.strip().rstrip("-.,_ \n\t*`~")
-    for _ in range(1): # Reduced retries for speed
+    for _ in range(1):
         try:
             async with aiohttp.ClientSession() as s:
                 headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-                async with s.get(link, timeout=3, headers=headers) as resp: # Strict fast timeout
+                async with s.get(link, timeout=3, headers=headers) as resp:
                     if resp.status == 200:
                         text = await resp.text()
                         if any(x in text for x in ["Invite link is invalid", "Link is invalid", "has expired"]):
@@ -411,113 +417,120 @@ async def dispatch_result(r: dict, stats_tracker: dict):
     elif r["status"] == "skipped":
         await _send_raw(SKIPPED_CHANNEL_ID, f"<b>⚠️ SKIPPED LINK</b>\n━━━━━━━━━━\n{msg}")
 
+
 # ─────────────────────────────────────────
-#  SCRAPER LOGIC (SENDS TO STORAGE)
+#  SCRAPER & AUTO-UPDATES (TODAY'S UPDATES)
 # ─────────────────────────────────────────
-async def _run_scraper_task(uid: int, cid: int, state: dict):
+async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True):
     scraper_path = os.path.join(SESSIONS_DIR, f"scraper_{uid}")
     if not os.path.exists(scraper_path + ".session"):
-        await _send_raw(cid, "❌ Scraper ID is not logged in!")
+        if manual: await _send_raw(cid, "❌ Scraper ID is not logged in!")
         return
 
-    channel = state.get("channel")
-    start_msg_id = state.get("start_msg_id", 1)
-    
-    if not channel:
-        await _send_raw(cid, "❌ Please set the Target Channel first.")
+    targets = state.get("targets", [])
+    if not targets:
+        if manual: await _send_raw(cid, "❌ No Targets set! Please Add Target first.")
         return
 
     app = Client(scraper_path, api_id=API_ID, api_hash=API_HASH, no_updates=True)
     try:
         await app.connect()
-        try: chat = await app.get_chat(channel)
-        except Exception as e:
-            await app.disconnect()
-            await _send_raw(cid, f"❌ Failed to get channel: {e}\n(Make sure Scraper ID is inside the channel or it's public)")
-            return
-            
-        await _send_raw(cid, f"🕷️ <b>Scraper Started!</b>\nTarget: {chat.title}\nStarting from Message ID: <code>{start_msg_id}</code>\n<i>Links will be sent directly to your Storage Bot/Channel.</i>")
-        
-        prog_resp = await _send_raw(cid, f"🔄 <b>Scraper Progress:</b>\nStarting up...")
-        prog_msg_id = prog_resp.get("result", {}).get("message_id") if isinstance(prog_resp, dict) else None
-        
-        if prog_msg_id:
-            await _pin_message(cid, prog_msg_id)
-            state["progress_msg_id"] = prog_msg_id
-            save_scraper_state(uid, state)
-
-        current_id = start_msg_id
-        batch_size = 50
-        empty_batches = 0
         total_extracted = 0
-
         if uid not in SCRAPER_DUPLICATES: SCRAPER_DUPLICATES[uid] = set()
 
-        while SCRAPER_TASKS.get(uid) == "running":
-            message_ids = list(range(current_id, current_id + batch_size))
+        if manual:
+            prog_resp = await _send_raw(cid, f"🔄 <b>Scraping Today's Updates from {len(targets)} Targets...</b>")
+            prog_msg_id = prog_resp.get("result", {}).get("message_id") if isinstance(prog_resp, dict) else None
+        
+        yesterday = datetime.now() - timedelta(hours=24)
+        
+        for target in targets:
             try:
-                messages = await app.get_messages(chat.id, message_ids)
-                
+                chat = await app.get_chat(target)
                 chunk_links = []
-                
-                for msg in messages:
-                    if not msg or msg.empty: continue
+                async for msg in app.get_chat_history(chat.id):
+                    if msg.date < yesterday:
+                        break # Stop checking older messages
+                    
                     text = (msg.text or msg.caption or "")
                     links = extract_links(text)
-                    
                     for l in links:
                         if l not in SCRAPER_DUPLICATES[uid]:
                             chunk_links.append(l)
                             SCRAPER_DUPLICATES[uid].add(l)
                             total_extracted += 1
                 
+                # Send to Storage Channel
                 if chunk_links:
-                    empty_batches = 0
                     for i in range(0, len(chunk_links), 50): 
                         send_chunk = chunk_links[i:i+50]
                         text_to_send = "\n".join(send_chunk)
                         try:
                             await _send_raw(STORAGE_CHANNEL_ID, text_to_send)
-                        except Exception as e: pass
-                        await asyncio.sleep(1) # Fast delay to avoid limits
-                else:
-                    empty_batches += 1
-                    
-                current_id += batch_size
-                state["start_msg_id"] = current_id
-                save_scraper_state(uid, state)
-
-                if prog_msg_id:
-                    status_text = (
-                        f"🔄 <b>Scraper Progress:</b>\n"
-                        f"🎯 <b>Target:</b> {chat.title}\n"
-                        f"📍 <b>Processed up to Msg ID:</b> <code>{current_id}</code>\n"
-                        f"📥 <b>Links Extracted:</b> <code>{total_extracted}</code>"
-                    )
-                    payload = {"chat_id": cid, "message_id": prog_msg_id, "text": status_text, "parse_mode": "HTML"}
-                    async with aiohttp.ClientSession() as s: await s.post(f"{TG_API}/editMessageText", json=payload)
-                
-                if empty_batches >= 100: 
-                    await _send_raw(cid, "✅ <b>Scraper Finished!</b>\nReached the end of available messages.")
-                    SCRAPER_TASKS[uid] = "stopped"
-                    break
-                    
-                await asyncio.sleep(1) # Reduced from 5s to 1s for fast scraping
-                
+                        except: pass
+                        await asyncio.sleep(1)
+                        
             except FloodWait as e:
-                await asyncio.sleep(e.value + 5)
+                await asyncio.sleep(e.value + 2)
             except Exception as e:
-                logger.error(f"Scraper Error: {e}")
-                await asyncio.sleep(2)
+                logger.error(f"Scraper error on target {target}: {e}")
 
         await app.disconnect()
+        
+        # Update Last Run Time
+        state["last_run"] = time.time()
+        save_scraper_state(uid, state)
+
+        msg_done = f"✅ <b>Scraping Complete!</b>\nExtracted <code>{total_extracted}</code> new links from {len(targets)} targets in the last 24h.\n\n"
+        
+        # Auto Trigger Account Bank Checker from Storage
+        sessions = get_user_sessions(uid)
+        if sessions and total_extracted > 0:
+            msg_done += "🤖 <i>Auto-starting Account Bank logic from Storage...</i>"
+            if manual: await _send_raw(cid, msg_done)
+            
+            # Start Background check if not already running
+            if not CHECKING_LOCKS.get(uid):
+                CHECKING_LOCKS[uid] = True
+                asyncio.create_task(_run_bulk_check(uid, cid, sessions, auto_storage=True))
+        else:
+            if total_extracted == 0:
+                msg_done += "No new links found."
+            else:
+                msg_done += "⚠️ No Checker Accounts in Bank! Please login to Account Bank to process them."
+            if manual: await _send_raw(cid, msg_done)
 
     except Exception as e:
-        await _send_raw(cid, f"❌ Scraper crashed: {e}")
+        if manual: await _send_raw(cid, f"❌ Scraper crashed: {e}")
         try: await app.disconnect()
         except: pass
-    
+        
     SCRAPER_TASKS[uid] = "stopped"
+
+async def auto_scraper_loop():
+    """Background task that checks every hour if any user needs their 12h auto-scrape"""
+    while True:
+        try:
+            if os.path.exists(USERS_FILE):
+                with open(USERS_FILE, "r") as f:
+                    users = f.read().splitlines()
+                
+                for uid_str in users:
+                    uid = int(uid_str)
+                    state = load_scraper_state(uid)
+                    
+                    if state.get("auto_run", False):
+                        last_run = state.get("last_run", 0)
+                        if (time.time() - last_run) >= (12 * 3600): # 12 Hours
+                            # User has auto enabled and 12h passed
+                            if SCRAPER_TASKS.get(uid) != "running":
+                                SCRAPER_TASKS[uid] = "running"
+                                # Using ADMIN_ID chat for notifications implicitly, or just run silently
+                                asyncio.create_task(_run_daily_scraper_task(uid, uid, state, manual=False))
+        except Exception as e:
+            logger.error(f"Auto Scraper Loop Error: {e}")
+            
+        await asyncio.sleep(3600) # Check every 1 hour
 
 # ─────────────────────────────────────────
 #  NON-BLOCKING DASHBOARD UPDATER
@@ -595,7 +608,7 @@ async def _update_dashboard_if_needed(uid: int, force=False):
     except: pass
 
 # ─────────────────────────────────────────
-#  BULK RUNNER WITH QUEUE (AUTO STORAGE PULL ADDED)
+#  BULK RUNNER WITH QUEUE (AUTO STORAGE PULL)
 # ─────────────────────────────────────────
 async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False):
     QUEUE_CONTROL[uid] = "running"
@@ -646,7 +659,6 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False
                 await asyncio.sleep(1)
                 continue
 
-            # Auto Pull Logic From Storage Channel (Fixed Skipping Bug)
             if not USER_QUEUES.get(uid):
                 if not auto_storage: 
                     break 
@@ -655,7 +667,6 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False
                     messages_received = 0
                     try:
                         c_app = CHECKER_STATE[uid]["clients"][client_keys[0]]["app"]
-                        # Fetch batch of 50 messages to prevent stopping early on empty gaps
                         msg_ids_to_fetch = list(range(storage_last_msg_id, storage_last_msg_id + 50))
                         messages = await c_app.get_messages(STORAGE_CHANNEL_ID, msg_ids_to_fetch)
                         
@@ -690,15 +701,13 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False
                     
                     if not USER_QUEUES.get(uid):
                         await _update_dashboard_if_needed(uid, force=True)
-                        if empty_storage_batches > 20: # Tolerance of 1000 empty messages gap
+                        if empty_storage_batches > 20: 
                             await _send_raw(cid, "✅ <b>Storage Checking Paused/Finished.</b>\nReached the end of available messages in Storage. Will re-check soon if resumed.")
                             break
                         
                         if messages_received == 0:
-                            # Reached end of channel, wait for new messages
                             await asyncio.sleep(5) 
                         else:
-                            # Messages were fetched but no links found, instantly continue to next chunk
                             await asyncio.sleep(0.1)
                         continue
 
@@ -763,8 +772,6 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False
             asyncio.create_task(dispatch_result(final_result, stats))
             await _update_dashboard_if_needed(uid)
 
-            # 🚀 DELAY LOGIC: Now it purely delays on Active Links. 
-            # Expired and Skipped links will bypass this instantly.
             if final_result["status"] == "active" and not fast_checked_expired:
                 min_del, max_del = USER_DELAYS.get(uid, (10.0, 15.0))
                 delay = random.uniform(min_del, max_del)
@@ -798,7 +805,7 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False
                  f"📤 Fwd On: <code>{stats['fwd']}</code> | 💬 Chat On: <code>{stats['chat']}</code> | ➕ Add Mem(Txt): <code>{stats['add_chat']}</code> | Add Mem(Media): <code>{stats.get('add_media', 0)}</code>\n\n"
                  f"📱 <b>Final ID Performance:</b>\n<code>{perf_text}</code>")
     
-    keyboard = [[{"text": "🔙 Main Menu", "callback_data": "back_main"}]]
+    keyboard = [[{"text": "🔙 Main Menu", "callback_data": "menu_pro"}]]
     if dash_msg_id:
         try:
             payload = {"chat_id": cid, "message_id": dash_msg_id, "text": final_msg, "parse_mode": "HTML", "reply_markup": {"inline_keyboard": keyboard}}
@@ -817,14 +824,21 @@ async def _edit_raw(chat_id, message_id, text, keyboard=None):
     if keyboard: payload["reply_markup"] = {"inline_keyboard": keyboard}
     async with aiohttp.ClientSession() as s: await s.post(f"{TG_API}/editMessageText", json=payload)
 
-def MAIN_KB(uid):
+def START_KB():
+    return [
+        [{"text": "🔍 Link Without Account (Fast Check)", "callback_data": "menu_guest"}],
+        [{"text": "👑 Link Pro (Advanced Dashboard)", "callback_data": "menu_pro"}]
+    ]
+
+def PRO_KB(uid):
     sessions = get_user_sessions(uid)
     return [
-        [{"text": "📥 Auto-Check Storage", "callback_data": "menu_storage"}],
-        [{"text": "🔗 Manual Check Links", "callback_data": "menu_check"}],
-        [{"text": "🕷️ Scraper Menu", "callback_data": "menu_scraper"}],
-        [{"text": f"📱 Manage IDs ({len(sessions)} Active)", "callback_data": "menu_accounts"}],
-        [{"text": "⚙️ Settings", "callback_data": "menu_settings"}]
+        [{"text": f"🏦 Account Bank ({len(sessions)} Active)", "callback_data": "menu_accounts"}],
+        [{"text": "🕷️ Scraper ID & Targets", "callback_data": "menu_scraper"}],
+        [{"text": "📥 Get Today Updates", "callback_data": "scraper_today"}],
+        [{"text": "🔗 Check Links (Manual)", "callback_data": "menu_check"}],
+        [{"text": "⚙️ Settings", "callback_data": "menu_settings"}],
+        [{"text": "🔙 Back", "callback_data": "back_start"}]
     ]
 
 # ─────────────────────────────────────────
@@ -835,15 +849,28 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     track_user(uid)
     ctx.user_data["mode"] = ""
     await cleanup_login_state(uid)
-    text = f"👋 <b>Welcome {update.effective_user.first_name}</b>\n\nAdvanced Link Checker Bot.\nYou can login unlimited IDs to check links securely without bans."
-    await _send_raw(update.effective_chat.id, text, MAIN_KB(uid))
+    text = f"👋 <b>Welcome {update.effective_user.first_name}</b>\n\nAdvanced Link Checker & Scraper Bot.\nChoose an option below:"
+    await _send_raw(update.effective_chat.id, text, START_KB())
 
 async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; d = q.data; uid = q.from_user.id; cid = q.message.chat.id; mid = q.message.message_id
     track_user(uid)
     async with aiohttp.ClientSession() as s: await s.post(f"{TG_API}/answerCallbackQuery", json={"callback_query_id": q.id})
 
-    if d.startswith("tog_id_"):
+    if d == "back_start":
+        await cleanup_login_state(uid)
+        ctx.user_data["mode"] = ""
+        await _edit_raw(cid, mid, "👋 <b>Welcome!</b>\nChoose an option below:", START_KB())
+
+    elif d == "menu_guest":
+        ctx.user_data["mode"] = "guest_check"
+        await _edit_raw(cid, mid, "🔍 <b>Guest Mode (No Account Needed)</b>\n\nJust send me any links here. I will do a basic scan and tell you if they are Active or Expired.\n\n<i>Note: This mode doesn't check Members, Photos, Chat features etc.</i>", [[{"text": "🔙 Back", "callback_data": "back_start"}]])
+
+    elif d == "menu_pro":
+        ctx.user_data["mode"] = ""
+        await _edit_raw(cid, mid, "👑 <b>Link Pro Dashboard</b>\n\nWelcome to the advanced menu. Here you can add your Account Bank, Set Scraper Targets, and automate everything.", PRO_KB(uid))
+
+    elif d.startswith("tog_id_"):
         c_key = d.split("tog_id_")[1]
         if uid in CHECKER_STATE and c_key in CHECKER_STATE[uid]["clients"]:
             current_status = CHECKER_STATE[uid]["clients"][c_key]["enabled"]
@@ -862,14 +889,9 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         QUEUE_CONTROL[uid] = "stopped"
         SCRAPER_TASKS[uid] = "stopped"
 
-    elif d == "back_main":
-        await cleanup_login_state(uid)
-        ctx.user_data["mode"] = ""
-        await _edit_raw(cid, mid, "👋 <b>Main Menu</b>\n\nChoose an option below:", MAIN_KB(uid))
-
     elif d == "menu_settings":
         min_d, max_d = USER_DELAYS.get(uid, (10.0, 15.0))
-        kb = [[{"text": "⏱️ Set Custom Delay", "callback_data": "set_delay"}], [{"text": "🔙 Back", "callback_data": "back_main"}]]
+        kb = [[{"text": "⏱️ Set Custom Delay", "callback_data": "set_delay"}], [{"text": "🔙 Back", "callback_data": "menu_pro"}]]
         await _edit_raw(cid, mid, f"⚙️ <b>Settings Panel</b>\n\n⏱️ <b>Current Delay:</b> {min_d}s to {max_d}s\n\n*(Change the delay carefully to avoid getting your IDs banned)*", kb)
 
     elif d == "set_delay":
@@ -880,22 +902,29 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         state = load_scraper_state(uid)
         scraper_path = os.path.join(SESSIONS_DIR, f"scraper_{uid}.session")
         is_logged_in = "✅ Logged In" if os.path.exists(scraper_path) else "❌ Not Logged In"
+        auto_stat = "✅ ON" if state.get("auto_run") else "❌ OFF"
+        targets = state.get("targets", [])
         
         kb = [
             [{"text": "➕ Login Scraper ID" if not os.path.exists(scraper_path) else "🗑 Logout Scraper ID", "callback_data": "scraper_login_tog"}],
-            [{"text": "🎯 Set Target Channel", "callback_data": "scraper_set_target"}],
-            [{"text": "📍 Set Start Link (Msg ID)", "callback_data": "scraper_set_start"}],
-            [{"text": "▶️ Start Scraping", "callback_data": "scraper_start"}, {"text": "🛑 Stop", "callback_data": "scraper_stop"}],
-            [{"text": "🔄 Refresh / Restart Scraper", "callback_data": "scraper_refresh"}],
-            [{"text": "🔙 Back", "callback_data": "back_main"}]
+            [{"text": "🎯 Add Target", "callback_data": "scraper_add_target"}, {"text": "🗑 Remove Target", "callback_data": "scraper_rem_target"}],
+            [{"text": f"🔄 12-Hour Auto: {auto_stat}", "callback_data": "scraper_tog_auto"}],
+            [{"text": "🔙 Back", "callback_data": "menu_pro"}]
         ]
         
-        text = (f"🕷️ <b>Scraper Management</b>\n\n"
-                f"👤 <b>Status:</b> {is_logged_in}\n"
-                f"🎯 <b>Target Channel:</b> <code>{state['channel'] or 'None'}</code>\n"
-                f"📍 <b>Start Message ID:</b> <code>{state['start_msg_id']}</code>\n\n"
-                f"<i>(Set channel and start point, then click Start. It will extract links safely and send to queue automatically.)</i>")
+        t_list = "\n".join([f"• <code>{t}</code>" for t in targets]) if targets else "None"
+        
+        text = (f"🕷️ <b>Scraper ID & Target Manager</b>\n\n"
+                f"👤 <b>ID Status:</b> {is_logged_in}\n"
+                f"🎯 <b>Active Targets ({len(targets)}):</b>\n{t_list}\n\n"
+                f"<i>(You can add targets by forwarding a message from the group or sending the Chat ID directly.)</i>")
         await _edit_raw(cid, mid, text, kb)
+
+    elif d == "scraper_tog_auto":
+        state = load_scraper_state(uid)
+        state["auto_run"] = not state.get("auto_run", False)
+        save_scraper_state(uid, state)
+        await on_callback(Update(update.update_id, callback_query=update.callback_query._replace(data="menu_scraper")), ctx)
 
     elif d == "scraper_login_tog":
         scraper_path = os.path.join(SESSIONS_DIR, f"scraper_{uid}.session")
@@ -907,40 +936,42 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ctx.user_data["login_type"] = "scraper"
             await _edit_raw(cid, mid, "📱 Send your Telegram Phone Number with country code for **SCRAPER ID**.\nExample: <code>+919876543210</code>", [[{"text": "🔙 Cancel", "callback_data": "menu_scraper"}]])
 
-    elif d == "scraper_set_target":
+    elif d == "scraper_add_target":
         ctx.user_data["mode"] = "scraper_target"
-        await _edit_raw(cid, mid, "🎯 <b>Send Target Channel Username or ID</b>\n\nExample: `-10012345678` or `@mychannel`", [[{"text": "🔙 Cancel", "callback_data": "menu_scraper"}]])
+        await _edit_raw(cid, mid, "🎯 <b>Add New Scraper Target</b>\n\nYou can:\n1. Forward any message from the Group/Channel here.\n2. Or Send the Chat ID (e.g. `-10012345678`)", [[{"text": "🔙 Cancel", "callback_data": "menu_scraper"}]])
 
-    elif d == "scraper_set_start":
-        ctx.user_data["mode"] = "scraper_start_link"
-        await _edit_raw(cid, mid, "📍 <b>Send Specific Message Link</b>\n\nExample: `https://t.me/c/12345/600`\n<i>(Bot will start scraping from Message ID 600)</i>", [[{"text": "🔙 Cancel", "callback_data": "menu_scraper"}]])
+    elif d == "scraper_rem_target":
+        state = load_scraper_state(uid)
+        targets = state.get("targets", [])
+        if not targets:
+            await _edit_raw(cid, mid, "❌ No targets to remove.", [[{"text": "🔙 Back", "callback_data": "menu_scraper"}]])
+            return
+        
+        kb = []
+        for t in targets:
+            kb.append([{"text": f"❌ {t}", "callback_data": f"rem_t_{t}"}])
+        kb.append([{"text": "🔙 Cancel", "callback_data": "menu_scraper"}])
+        await _edit_raw(cid, mid, "🗑 <b>Select Target to Remove:</b>", kb)
 
-    elif d == "scraper_start":
+    elif d.startswith("rem_t_"):
+        t_id = d.split("rem_t_")[1]
+        state = load_scraper_state(uid)
+        try: t_id = int(t_id) if t_id.lstrip('-').isdigit() else t_id
+        except: pass
+        if t_id in state["targets"]: state["targets"].remove(t_id)
+        elif str(t_id) in state["targets"]: state["targets"].remove(str(t_id))
+        save_scraper_state(uid, state)
+        await on_callback(Update(update.update_id, callback_query=update.callback_query._replace(data="menu_scraper")), ctx)
+
+    elif d == "scraper_today":
         if SCRAPER_TASKS.get(uid) == "running":
-            await _edit_raw(cid, mid, "⚠️ Scraper is already running!", [[{"text": "🔙 Scraper Menu", "callback_data": "menu_scraper"}]])
+            await _edit_raw(cid, mid, "⚠️ Scraper is already running!", [[{"text": "🔙 Back", "callback_data": "menu_pro"}]])
             return
         
         state = load_scraper_state(uid)
         SCRAPER_TASKS[uid] = "running"
-        asyncio.create_task(_run_scraper_task(uid, cid, state))
-        await _edit_raw(cid, mid, "✅ Scraper background task started! Progress will be pinned shortly.", [[{"text": "🔙 Scraper Menu", "callback_data": "menu_scraper"}]])
-
-    elif d == "scraper_stop":
-        SCRAPER_TASKS[uid] = "stopped"
-        await _edit_raw(cid, mid, "🛑 Scraper stopped.", [[{"text": "🔙 Scraper Menu", "callback_data": "menu_scraper"}]])
-
-    elif d == "scraper_refresh":
-        if SCRAPER_TASKS.get(uid) == "running":
-            await _edit_raw(cid, mid, "⚠️ <b>Please Stop the scraper first before refreshing!</b>", [[{"text": "🔙 Scraper Menu", "callback_data": "menu_scraper"}]])
-            return
-            
-        state = load_scraper_state(uid)
-        state["start_msg_id"] = 1
-        if uid in SCRAPER_DUPLICATES:
-            SCRAPER_DUPLICATES[uid].clear()
-        save_scraper_state(uid, state)
-        
-        await _edit_raw(cid, mid, "🔄 <b>Scraper Reset Successfully!</b>\n\nAll duplicate cache cleared. Scraper will now start completely fresh from Message ID 1.", [[{"text": "🔙 Scraper Menu", "callback_data": "menu_scraper"}]])
+        asyncio.create_task(_run_daily_scraper_task(uid, cid, state, manual=True))
+        await _edit_raw(cid, mid, "✅ Initiating Today's Scrape... Check below for progress.", [[{"text": "🔙 Menu Pro", "callback_data": "menu_pro"}]])
 
     elif d == "menu_accounts":
         sessions = get_user_sessions(uid)
@@ -949,8 +980,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             base_name = os.path.basename(s)
             kb.append([{"text": f"🗑 Logout ID: {base_name}", "callback_data": f"logout_{base_name}"}])
         if len(sessions) > 1: kb.append([{"text": "🗑 Logout All IDs", "callback_data": "logout_all"}])
-        kb.append([{"text": "🔙 Back", "callback_data": "back_main"}])
-        await _edit_raw(cid, mid, f"📱 <b>Checker Account Manager</b>\n\nLogged in IDs: <b>{len(sessions)}</b>\n\nYou can logout specific IDs, add new ones, or check their health.", kb)
+        kb.append([{"text": "🔙 Back", "callback_data": "menu_pro"}])
+        await _edit_raw(cid, mid, f"🏦 <b>Account Bank Manager</b>\n\nLogged in IDs: <b>{len(sessions)}</b>\n\nYou can logout specific IDs, add new ones (10-15 recommended), or check their health.", kb)
 
     elif d == "check_health":
         await _edit_raw(cid, mid, "⏳ <b>Checking health of all logged-in Checker IDs...</b>\n\n<i>This might take a moment.</i>")
@@ -964,7 +995,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await app.disconnect()
             except Exception: dead_count += 1
         
-        kb = [[{"text": "🔙 Back to Manage IDs", "callback_data": "menu_accounts"}]]
+        kb = [[{"text": "🔙 Back to Account Bank", "callback_data": "menu_accounts"}]]
         await _edit_raw(cid, mid, f"🩺 <b>Account Status Report</b>\n\n✅ <b>Working IDs:</b> {working_count}\n❌ <b>Dead/Logged Out:</b> {dead_count}\n\n<i>(If you have dead IDs, please find and logout them manually to save resources)</i>", kb)
 
     elif d.startswith("logout_u"):
@@ -978,8 +1009,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             base_name = os.path.basename(s)
             kb.append([{"text": f"🗑 Logout ID: {base_name}", "callback_data": f"logout_{base_name}"}])
         if len(sessions) > 1: kb.append([{"text": "🗑 Logout All IDs", "callback_data": "logout_all"}])
-        kb.append([{"text": "🔙 Back", "callback_data": "back_main"}])
-        await _edit_raw(cid, mid, f"✅ ID <code>{session_name}</code> Logged Out.\n\n📱 <b>Account Manager</b>\nLogged in IDs: <b>{len(sessions)}</b>", kb)
+        kb.append([{"text": "🔙 Back", "callback_data": "menu_pro"}])
+        await _edit_raw(cid, mid, f"✅ ID <code>{session_name}</code> Logged Out.\n\n🏦 <b>Account Bank</b>\nLogged in IDs: <b>{len(sessions)}</b>", kb)
 
     elif d == "logout_all":
         for s in get_user_sessions(uid):
@@ -996,44 +1027,14 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif d == "menu_check":
         sessions = get_user_sessions(uid)
         if not sessions:
-            await _edit_raw(cid, mid, "❌ <b>No IDs Found!</b>\n\nPlease go to 'Manage IDs' and login at least 1 account before checking links.", [[{"text": "🔙 Back", "callback_data": "back_main"}]])
+            await _edit_raw(cid, mid, "❌ <b>No IDs Found!</b>\n\nPlease go to 'Account Bank' and login at least 1 account before checking links.", [[{"text": "🔙 Back", "callback_data": "menu_pro"}]])
             return
         ctx.user_data["mode"] = "checking_links"
         
         if uid in CHECKER_DUPLICATES:
             CHECKER_DUPLICATES[uid].clear()
             
-        await _edit_raw(cid, mid, f"🔗 <b>SEND LINKS NOW</b>\n\nSend up to unlimited links (Forward chunks smoothly).\nBot will process them securely using your {len(sessions)} logged-in IDs with Fallback Support.", [[{"text": "🔙 Back", "callback_data": "back_main"}]])
-
-    elif d == "menu_storage":
-        current_id = load_storage_state(uid)
-        kb = [
-            [{"text": "▶️ Start Auto-Check", "callback_data": "start_storage_check"}],
-            [{"text": "🔄 Reset Storage Progress", "callback_data": "reset_storage_check"}],
-            [{"text": "🔙 Back", "callback_data": "back_main"}]
-        ]
-        await _edit_raw(cid, mid, f"📥 <b>Storage Auto-Check Menu</b>\n\n📌 <b>Current Position:</b> Message ID <code>{current_id}</code>\n\n<i>Start checking links automatically from your Storage Channel.</i>", kb)
-
-    elif d == "reset_storage_check":
-        save_storage_state(uid, 1)
-        if uid in CHECKER_DUPLICATES:
-            CHECKER_DUPLICATES[uid].clear()
-        kb = [[{"text": "🔙 Back to Storage Menu", "callback_data": "menu_storage"}]]
-        await _edit_raw(cid, mid, "✅ <b>Storage Progress Reset!</b>\n\nThe bot will now start checking from the very first message in the Storage Channel. Duplicate cache is also cleared.", kb)
-
-    elif d == "start_storage_check":
-        sessions = get_user_sessions(uid)
-        if not sessions:
-            await _edit_raw(cid, mid, "❌ <b>No IDs Found!</b>\n\nPlease go to 'Manage IDs' and login at least 1 account.", [[{"text": "🔙 Back", "callback_data": "back_main"}]])
-            return
-        
-        ctx.user_data["mode"] = "storage_checking"
-        if CHECKING_LOCKS.get(uid):
-            await _edit_raw(cid, mid, "⚠️ <b>Queue is already running!</b>", [[{"text": "🔙 Back", "callback_data": "back_main"}]])
-            return
-            
-        CHECKING_LOCKS[uid] = True
-        asyncio.create_task(_run_bulk_check(uid, cid, sessions, auto_storage=True))
+        await _edit_raw(cid, mid, f"🔗 <b>SEND LINKS NOW (MANUAL MODE)</b>\n\nSend up to unlimited links (Forward chunks smoothly).\nBot will process them securely using your {len(sessions)} logged-in IDs in the Account Bank.", [[{"text": "🔙 Back", "callback_data": "menu_pro"}]])
 
 async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not update.message: return
@@ -1043,27 +1044,47 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if text == "/start": return 
 
-    if mode == "scraper_target":
-        state = load_scraper_state(uid)
-        try:
-            val = int(text)
-            state["channel"] = val
-        except:
-            state["channel"] = text
-        save_scraper_state(uid, state)
-        ctx.user_data["mode"] = ""
-        await update.message.reply_text(f"✅ Target Channel set to: <code>{state['channel']}</code>", parse_mode="HTML")
+    if mode == "guest_check":
+        links = extract_links(text)
+        if not links:
+            await update.message.reply_text("❌ No valid Telegram links found.", parse_mode="HTML")
+            return
+        
+        msg = await update.message.reply_text("⏳ <b>Checking links without account...</b>", parse_mode="HTML")
+        res_text = "🔍 <b>Guest Check Results</b>\n━━━━━━━━━━\n"
+        
+        for l in links:
+            status = await fast_http_link_check(l)
+            if status == "expired":
+                res_text += f"❌ {l} - Expired/Invalid\n"
+            elif status == "active":
+                res_text += f"✅ {l} - Active Link\n"
+            else:
+                res_text += f"⚠️ {l} - Unknown/Requires Login\n"
+                
+        res_text += "\n<i>(For advanced stats, login via Link Pro)</i>"
+        await msg.edit_text(res_text, disable_web_page_preview=True, parse_mode="HTML")
 
-    elif mode == "scraper_start_link":
-        m = re.search(r"/(\d+)$", text)
-        if m:
-            state = load_scraper_state(uid)
-            state["start_msg_id"] = int(m.group(1))
-            save_scraper_state(uid, state)
-            ctx.user_data["mode"] = ""
-            await update.message.reply_text(f"✅ Start Message ID set to: <code>{state['start_msg_id']}</code>", parse_mode="HTML")
+    elif mode == "scraper_target":
+        state = load_scraper_state(uid)
+        target_val = None
+        
+        if update.message.forward_from_chat:
+            target_val = update.message.forward_from_chat.id
         else:
-            await update.message.reply_text("❌ Invalid link format. Make sure it ends with a message ID (e.g. `.../600`)", parse_mode="Markdown")
+            try: target_val = int(text)
+            except: target_val = text
+            
+        if target_val:
+            if target_val not in state.get("targets", []):
+                state["targets"].append(target_val)
+                save_scraper_state(uid, state)
+                await update.message.reply_text(f"✅ Target Successfully Added: <code>{target_val}</code>", parse_mode="HTML")
+            else:
+                await update.message.reply_text("⚠️ Target is already added.")
+            ctx.user_data["mode"] = ""
+        else:
+            await update.message.reply_text("❌ Invalid input.")
 
     elif mode == "setting_delay":
         try:
@@ -1108,7 +1129,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await app.sign_in(data["phone"], data["hash"], otp)
             await app.disconnect()
             del LOGIN_STATE[uid]; ctx.user_data["mode"] = ""
-            await msg.edit_text("✅ Login Successful!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('🔙 Menu', callback_data='back_main')]]))
+            await msg.edit_text("✅ Login Successful!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('🔙 Menu', callback_data='back_start')]]))
         except SessionPasswordNeeded:
             ctx.user_data["mode"] = "login_pwd"
             await msg.edit_text("🔐 Two-Step Verification is ON. Send your Password:")
@@ -1123,7 +1144,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await app.check_password(text)
             await app.disconnect()
             del LOGIN_STATE[uid]; ctx.user_data["mode"] = ""
-            await msg.edit_text("✅ Login Successful!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('🔙 Menu', callback_data='back_main')]]))
+            await msg.edit_text("✅ Login Successful!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('🔙 Menu', callback_data='back_start')]]))
         except Exception as e:
             await msg.edit_text(f"❌ Error: {e}"); await app.disconnect(); ctx.user_data["mode"] = ""
 
@@ -1174,7 +1195,13 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
-    print("Bot is running perfectly with Smart Features & Fast Storage Pull...")
+    
+    print("Bot is running with Advanced Features & 12H Auto-Scraper System...")
+    
+    # Start the background auto-scraper loop
+    loop = asyncio.get_event_loop()
+    loop.create_task(auto_scraper_loop())
+    
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
