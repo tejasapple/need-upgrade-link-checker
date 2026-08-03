@@ -28,8 +28,8 @@ from pyrogram.raw.types import ChatInviteAlready, ChatInvite
 #  CONFIG 
 # ─────────────────────────────────────────
 BOT_TOKEN = "8277915856:AAENwF3ByzZ7FKZ7CWLaxiVqCPtmgciEkQ4"
-API_ID    = 36705510
-API_HASH  = "181d6a086c416df366680a380f5d6c46"
+API_ID    = 28980295
+API_HASH  = "c378a9631b9adaf795fe9562c95dbd24"
 
 ADMIN_ID  = 8884734704
 
