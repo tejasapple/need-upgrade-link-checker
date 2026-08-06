@@ -1121,7 +1121,14 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         state = load_scraper_state(uid)
         target_val = None
         
-        if update.message.forward_from_chat:
+        forward_origin = getattr(update.message, 'forward_origin', None)
+        
+        if forward_origin:
+            if hasattr(forward_origin, 'chat') and forward_origin.chat:
+                target_val = str(forward_origin.chat.id)
+            elif hasattr(forward_origin, 'sender_chat') and forward_origin.sender_chat:
+                target_val = str(forward_origin.sender_chat.id)
+        elif getattr(update.message, 'forward_from_chat', None):
             target_val = str(update.message.forward_from_chat.id)
         else:
             text_val = text.strip()
