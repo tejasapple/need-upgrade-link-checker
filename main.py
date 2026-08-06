@@ -445,9 +445,40 @@ async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True):
             prog_msg_id = prog_resp.get("result", {}).get("message_id") if isinstance(prog_resp, dict) else None
         
         for target, last_msg_id in targets.items():
-            print(f"[{datetime.now()}] 📡 Scraping target: {target}")
+            print(f"[{datetime.now()}] 📡 Resolving & Scraping target: {target}")
             try:
-                chat = await app.get_chat(target)
+                # --- NEW SMART LINK RESOLVER LOGIC ---
+                chat_target = target
+                try: 
+                    chat_target = int(target)
+                except ValueError: 
+                    pass
+
+                chat = None
+                if isinstance(chat_target, str) and ("t.me/+" in chat_target or "joinchat" in chat_target):
+                    try:
+                        chat = await app.join_chat(chat_target)
+                    except UserAlreadyParticipant:
+                        chat = await app.get_chat(chat_target)
+                elif isinstance(chat_target, str) and "t.me/" in chat_target:
+                    if "/c/" in chat_target:
+                        parts = chat_target.split("/c/")[1].split("/")
+                        chat_id = int("-100" + parts[0])
+                        chat = await app.get_chat(chat_id)
+                        # If a specific message was linked, we can use it to update last_msg_id intelligently
+                        if len(parts) > 1 and last_msg_id == 0:
+                            last_msg_id = int(parts[1]) - 1 # Start scraping from that message
+                    else:
+                        username = chat_target.split("t.me/")[1].split("/")[0].split("?")[0]
+                        chat = await app.get_chat(username)
+                else:
+                    chat = await app.get_chat(chat_target)
+                # -------------------------------------
+
+                if not chat:
+                    print(f"[{datetime.now()}] ⚠️ Could not resolve chat for target {target}")
+                    continue
+
                 chunk_links = []
                 new_last_id = last_msg_id
                 
@@ -967,7 +998,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     elif d == "scraper_add_target":
         ctx.user_data["mode"] = "scraper_target"
-        await _edit_raw(cid, mid, "🎯 <b>Add New Scraper Target</b>\n\nYou can:\n1. Forward any message from the Group/Channel here.\n2. Or Send the Chat ID (e.g. `-10012345678`)", [[{"text": "🔙 Cancel", "callback_data": "menu_scraper"}]])
+        await _edit_raw(cid, mid, "🎯 <b>Add New Scraper Target</b>\n\nYou can:\n1. Forward any message from the Group/Channel here.\n2. Send the Chat ID (e.g. `-10012345678`)\n3. <b>[NEW]</b> Paste a Message Link (e.g. `t.me/c/12345/67` or `t.me/joinchat/...`)", [[{"text": "🔙 Cancel", "callback_data": "menu_scraper"}]])
 
     elif d == "scraper_rem_target":
         state = load_scraper_state(uid)
@@ -1085,6 +1116,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         res_text += "\n<i>(For advanced stats, login via Link Pro)</i>"
         await msg.edit_text(res_text, disable_web_page_preview=True, parse_mode="HTML")
 
+    # --- UPDATED TARGET ADDING LOGIC ---
     elif mode == "scraper_target":
         state = load_scraper_state(uid)
         target_val = None
@@ -1092,7 +1124,10 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if update.message.forward_from_chat:
             target_val = str(update.message.forward_from_chat.id)
         else:
-            target_val = text.strip()
+            text_val = text.strip()
+            # If user sends a link, username, or raw ID, save it directly
+            if "t.me/" in text_val or text_val.startswith("-100") or text_val.startswith("@") or text_val.isdigit():
+                target_val = text_val
             
         if target_val:
             targets = state.get("targets", {})
@@ -1100,12 +1135,12 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 targets[target_val] = 0
                 state["targets"] = targets
                 save_scraper_state(uid, state)
-                await update.message.reply_text(f"✅ Target Successfully Added: <code>{target_val}</code>\n\n<i>Note: On first run, it will extract ALL historical links. On next runs, it will only extract new ones.</i>", parse_mode="HTML")
+                await update.message.reply_text(f"✅ <b>Target Successfully Added:</b> <code>{target_val}</code>\n\n<i>Note: Your Scraper ID will automatically detect if it's already a member and start scraping new links from this chat!</i>", parse_mode="HTML")
             else:
                 await update.message.reply_text("⚠️ Target is already added.")
             ctx.user_data["mode"] = ""
         else:
-            await update.message.reply_text("❌ Invalid input.")
+            await update.message.reply_text("❌ <b>Invalid input.</b>\nPlease send a valid Chat ID, Username, or Message Link.")
 
     elif mode == "setting_delay":
         try:
