@@ -476,8 +476,37 @@ async def process_and_send_media(app, msg, dest_id, cid, status_msg_id=None):
                 os.remove(file_path)
             return True
         else:
-            await msg.copy(dest_id)
-            return True
+            try:
+                await msg.copy(dest_id)
+                return True
+            except Exception as inner_e:
+                logger.error(f"Copy failed ({inner_e}), triggering fallback manual download...")
+                
+                if status_msg_id:
+                    await _edit_raw(cid, status_msg_id, "📥 <b>Handling copy error, downloading media to VPS...</b>\n<i>Please wait...</i>")
+                
+                file_path = await app.download_media(msg)
+                if not file_path:
+                    if msg.text:
+                        await app.send_message(dest_id, text=msg.text)
+                    return True
+                
+                if msg.video:
+                    await app.send_video(dest_id, video=file_path, caption=caption)
+                elif msg.document:
+                    await app.send_document(dest_id, document=file_path, caption=caption)
+                elif msg.photo:
+                    await app.send_photo(dest_id, photo=file_path, caption=caption)
+                elif msg.audio:
+                    await app.send_audio(dest_id, audio=file_path, caption=caption)
+                else:
+                    if msg.text:
+                        await app.send_message(dest_id, text=msg.text)
+                
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                return True
+
     except FloodWait as e:
         await asyncio.sleep(e.value + 2)
         return False
