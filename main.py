@@ -486,12 +486,16 @@ async def dispatch_result(r: dict, stats_tracker: dict):
         await _send_raw(get_conf("SKIPPED_CHANNEL_ID"), f"<b>⚠️ SKIPPED LINK</b>\n━━━━━━━━━━\n{msg}")
 
 # ─────────────────────────────────────────
-#  MEDIA EXTRACTOR (ULTIMATE is_premium BUG FIX - DEEP TRY/CATCH)
+#  MEDIA EXTRACTOR (STRICTLY BOT UPLOAD FIX)
 # ─────────────────────────────────────────
 async def process_and_send_media(app, bot_uploader, msg, dest_id, cid, status_msg_id=None):
     if not msg or msg.empty: return False
-    caption = msg.caption or ""
     
+    # Get Text / Caption
+    caption = msg.caption or ""
+    if not caption and msg.text:
+        caption = msg.text
+        
     def get_media_property(m):
         for attr in ['video', 'document', 'photo', 'audio', 'animation', 'voice']:
             val = getattr(m, attr, None)
@@ -499,52 +503,32 @@ async def process_and_send_media(app, bot_uploader, msg, dest_id, cid, status_ms
         return None
         
     media_obj = get_media_property(msg)
-    is_protected = getattr(msg, 'has_protected_content', False)
-    
-    # 1. Direct Copy Block (For Unprotected Content)
-    # Using app (userbot) to copy directly in case it happens to be in the dest_id chat
-    if not is_protected:
-        try:
-            res = await msg.copy(dest_id)
-            if res: return True
-        except Exception as e:
-            if "is_premium" in str(e) or "NoneType" in str(e):
-                return True
-            logger.warning(f"Userbot Copy failed: {e}, falling back to download.")
             
-    # 2. Safety Check for Missing Media
+    # 1. Safety Check for Only-Text Messages (Upload via Bot)
     if not media_obj:
-        if msg.text:
+        if caption:
             try: 
-                await bot_uploader.send_message(dest_id, text=msg.text)
+                await bot_uploader.send_message(dest_id, text=caption)
                 return True
-            except: 
-                pass
+            except Exception as e: 
+                logger.error(f"Bot failed to send text: {e}")
         return False
         
-    # 3. Download Block (Deep Shield)
+    # 2. Download Media (Using Scraper ID / app)
     if status_msg_id: 
         await _edit_raw(cid, status_msg_id, "📥 <b>Downloading media to VPS...</b>\n<i>Please wait...</i>")
     
     file_path = None
     try: 
-        # Using string conversion completely circumvents the parsing crash
-        file_path = await app.download_media(str(media_obj.file_id))
-    except: 
+        file_path = await app.download_media(msg)
+    except Exception as e: 
+        logger.error(f"Download Error: {e}")
         pass
-    
-    if not file_path:
-        try: file_path = await app.download_media(media_obj)
-        except: pass
-        
-    if not file_path:
-        try: file_path = await app.download_media(msg)
-        except: pass
         
     if not file_path or not os.path.exists(file_path):
         return False
         
-    # 4. Upload Block via Bot Token (Fixes PeerIdInvalid issue for channels)
+    # 3. STRICT UPLOAD (Using Bot Token ONLY - Userbot Fallback Removed)
     if status_msg_id: 
         await _edit_raw(cid, status_msg_id, "📤 <b>Uploading media to destination via Bot...</b>")
     
@@ -559,26 +543,10 @@ async def process_and_send_media(app, bot_uploader, msg, dest_id, cid, status_ms
         else: await bot_uploader.send_document(dest_id, document=file_path, caption=caption)
         success = True
     except Exception as e:
-        error_msg = str(e).lower()
-        if "is_premium" in error_msg or "nonetype" in error_msg:
-            success = True
-        else:
-            logger.warning(f"Bot upload failed: {e}. Trying userbot fallback just in case...")
-            try:
-                if getattr(msg, 'video', None): await app.send_video(dest_id, video=file_path, caption=caption)
-                elif getattr(msg, 'document', None): await app.send_document(dest_id, document=file_path, caption=caption)
-                elif getattr(msg, 'photo', None): await app.send_photo(dest_id, photo=file_path, caption=caption)
-                elif getattr(msg, 'audio', None): await app.send_audio(dest_id, audio=file_path, caption=caption)
-                elif getattr(msg, 'animation', None): await app.send_animation(dest_id, animation=file_path, caption=caption)
-                elif getattr(msg, 'voice', None): await app.send_voice(dest_id, voice=file_path, caption=caption)
-                else: await app.send_document(dest_id, document=file_path, caption=caption)
-                success = True
-            except Exception as inner_e:
-                inner_err = str(inner_e).lower()
-                success = "is_premium" in inner_err or "nonetype" in inner_err
-                logger.error(f"Userbot fallback upload also failed: {inner_e}")
+        logger.error(f"Bot upload failed: {e}")
+        success = False
         
-    # 5. Cleanup
+    # 4. Cleanup Memory
     if os.path.exists(file_path):
         try: os.remove(file_path)
         except: pass
@@ -633,7 +601,7 @@ async def _run_media_extractor(uid: int, cid: int, target_link: str, mode: str, 
             if success:
                 await _edit_raw(cid, status_msg_id, f"✅ <b>Successfully Extracted Single Post!</b>\nSent to Target ID: <code>{dest_id}</code>")
             else:
-                await _edit_raw(cid, status_msg_id, "❌ <b>Failed to extract media.</b> (Message might be deleted, unsupported, or blocked by Telegram)")
+                await _edit_raw(cid, status_msg_id, "❌ <b>Failed to extract media.</b> (Bot must be Admin in target channel, or message is unsupported)")
 
         elif mode == "bulk":
             await _edit_raw(cid, status_msg_id, f"🔄 <b>Starting Bulk Extraction...</b>\nFrom Message ID: <code>{start_msg_id}</code> onwards.\n<i>Sending to: {dest_id}</i>")
@@ -641,29 +609,25 @@ async def _run_media_extractor(uid: int, cid: int, target_link: str, mode: str, 
             extracted_count = 0
             current_msg_id = start_msg_id
             empty_patches = 0
+            chunk_size = 20 # Increased limit for better bulk fetching
             
             while True:
                 try:
                     msgs = []
                     try:
-                        # Fetch in chunks
-                        msgs = await app.get_messages(chat.id, list(range(current_msg_id, current_msg_id + 10)))
+                        msgs = await app.get_messages(chat.id, list(range(current_msg_id, current_msg_id + chunk_size)))
                     except Exception as chunk_e:
-                        # CHUNK FALLBACK: If Pyrogram parser crashes on chunk, do One-by-One iteration to save the valid messages
-                        if "is_premium" in str(chunk_e) or "NoneType" in str(chunk_e):
-                            for single_id in range(current_msg_id, current_msg_id + 10):
-                                try:
-                                    m = await app.get_messages(chat.id, single_id)
-                                    if m: msgs.append(m)
-                                except: pass
-                        else:
-                            raise chunk_e
+                        for single_id in range(current_msg_id, current_msg_id + chunk_size):
+                            try:
+                                m = await app.get_messages(chat.id, single_id)
+                                if m: msgs.append(m)
+                            except: pass
 
                     valid_msgs = [m for m in msgs if m and not m.empty]
                     
                     if not valid_msgs:
                         empty_patches += 1
-                        if empty_patches > 5: 
+                        if empty_patches > 10: # Increased tolerance (will not skip prematurely at 16)
                             break
                     else:
                         empty_patches = 0
@@ -674,11 +638,11 @@ async def _run_media_extractor(uid: int, cid: int, target_link: str, mode: str, 
                             success = await process_and_send_media(app, bot_uploader, msg, dest_id, cid, None)
                             if success:
                                 extracted_count += 1
-                                if extracted_count % 5 == 0:
+                                if extracted_count % 3 == 0:
                                     await _edit_raw(cid, status_msg_id, f"🔄 <b>Bulk Extraction in Progress...</b>\nExtracted: <code>{extracted_count}</code> posts so far.")
-                            await asyncio.sleep(1.5)
+                            await asyncio.sleep(2) # Prevent FloodWait on Bot Uploads
                     
-                    current_msg_id += 10
+                    current_msg_id += chunk_size
                     
                 except FloodWait as fw:
                     await asyncio.sleep(fw.value + 5)
