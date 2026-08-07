@@ -569,7 +569,13 @@ async def _run_media_extractor(uid: int, cid: int, target_link: str, mode: str, 
         return
 
     app = Client(scraper_sessions[0], api_id=API_ID, api_hash=API_HASH, no_updates=True)
-    bot_uploader = Client("bot_uploader_temp", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True, no_updates=True)
+    
+    # ─────────────────────────────────────────
+    # FIX: Using persistent file session instead of in_memory=True
+    # This prevents the 401 AUTH_KEY_UNREGISTERED error completely
+    # ─────────────────────────────────────────
+    bot_session_path = os.path.join(SESSIONS_DIR, f"bot_uploader_{uid}")
+    bot_uploader = Client(bot_session_path, api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, no_updates=True)
     
     prog_resp = await _send_raw(cid, "🔄 <b>Connecting Scraper & Bot IDs to extract media...</b>")
     status_msg_id = prog_resp.get("result", {}).get("message_id") if isinstance(prog_resp, dict) else None
