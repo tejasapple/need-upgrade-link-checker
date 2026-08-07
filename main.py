@@ -488,7 +488,7 @@ async def dispatch_result(r: dict, stats_tracker: dict):
 # ─────────────────────────────────────────
 #  MEDIA EXTRACTOR (ULTIMATE is_premium BUG FIX - DEEP TRY/CATCH)
 # ─────────────────────────────────────────
-async def process_and_send_media(app, msg, dest_id, cid, status_msg_id=None):
+async def process_and_send_media(app, bot_uploader, msg, dest_id, cid, status_msg_id=None):
     if not msg or msg.empty: return False
     caption = msg.caption or ""
     
@@ -502,21 +502,21 @@ async def process_and_send_media(app, msg, dest_id, cid, status_msg_id=None):
     is_protected = getattr(msg, 'has_protected_content', False)
     
     # 1. Direct Copy Block (For Unprotected Content)
+    # Using app (userbot) to copy directly in case it happens to be in the dest_id chat
     if not is_protected:
         try:
             res = await msg.copy(dest_id)
             if res: return True
         except Exception as e:
             if "is_premium" in str(e) or "NoneType" in str(e):
-                # Pyrogram bug parsing the response after successful copy
                 return True
-            logger.warning(f"Copy failed: {e}, falling back to download.")
+            logger.warning(f"Userbot Copy failed: {e}, falling back to download.")
             
     # 2. Safety Check for Missing Media
     if not media_obj:
         if msg.text:
             try: 
-                await app.send_message(dest_id, text=msg.text)
+                await bot_uploader.send_message(dest_id, text=msg.text)
                 return True
             except: 
                 pass
@@ -544,23 +544,39 @@ async def process_and_send_media(app, msg, dest_id, cid, status_msg_id=None):
     if not file_path or not os.path.exists(file_path):
         return False
         
-    # 4. Upload Block (Deep Shield)
+    # 4. Upload Block via Bot Token (Fixes PeerIdInvalid issue for channels)
     if status_msg_id: 
-        await _edit_raw(cid, status_msg_id, "📤 <b>Uploading media to destination...</b>")
+        await _edit_raw(cid, status_msg_id, "📤 <b>Uploading media to destination via Bot...</b>")
     
     success = False
     try:
-        if getattr(msg, 'video', None): await app.send_video(dest_id, video=file_path, caption=caption)
-        elif getattr(msg, 'document', None): await app.send_document(dest_id, document=file_path, caption=caption)
-        elif getattr(msg, 'photo', None): await app.send_photo(dest_id, photo=file_path, caption=caption)
-        elif getattr(msg, 'audio', None): await app.send_audio(dest_id, audio=file_path, caption=caption)
-        elif getattr(msg, 'animation', None): await app.send_animation(dest_id, animation=file_path, caption=caption)
-        elif getattr(msg, 'voice', None): await app.send_voice(dest_id, voice=file_path, caption=caption)
-        else: await app.send_document(dest_id, document=file_path, caption=caption)
+        if getattr(msg, 'video', None): await bot_uploader.send_video(dest_id, video=file_path, caption=caption)
+        elif getattr(msg, 'document', None): await bot_uploader.send_document(dest_id, document=file_path, caption=caption)
+        elif getattr(msg, 'photo', None): await bot_uploader.send_photo(dest_id, photo=file_path, caption=caption)
+        elif getattr(msg, 'audio', None): await bot_uploader.send_audio(dest_id, audio=file_path, caption=caption)
+        elif getattr(msg, 'animation', None): await bot_uploader.send_animation(dest_id, animation=file_path, caption=caption)
+        elif getattr(msg, 'voice', None): await bot_uploader.send_voice(dest_id, voice=file_path, caption=caption)
+        else: await bot_uploader.send_document(dest_id, document=file_path, caption=caption)
         success = True
     except Exception as e:
-        # If it crashes here, the media has actually reached Telegram, Pyrogram just failed parsing the server response
-        success = "is_premium" in str(e) or "NoneType" in str(e)
+        error_msg = str(e).lower()
+        if "is_premium" in error_msg or "nonetype" in error_msg:
+            success = True
+        else:
+            logger.warning(f"Bot upload failed: {e}. Trying userbot fallback just in case...")
+            try:
+                if getattr(msg, 'video', None): await app.send_video(dest_id, video=file_path, caption=caption)
+                elif getattr(msg, 'document', None): await app.send_document(dest_id, document=file_path, caption=caption)
+                elif getattr(msg, 'photo', None): await app.send_photo(dest_id, photo=file_path, caption=caption)
+                elif getattr(msg, 'audio', None): await app.send_audio(dest_id, audio=file_path, caption=caption)
+                elif getattr(msg, 'animation', None): await app.send_animation(dest_id, animation=file_path, caption=caption)
+                elif getattr(msg, 'voice', None): await app.send_voice(dest_id, voice=file_path, caption=caption)
+                else: await app.send_document(dest_id, document=file_path, caption=caption)
+                success = True
+            except Exception as inner_e:
+                inner_err = str(inner_e).lower()
+                success = "is_premium" in inner_err or "nonetype" in inner_err
+                logger.error(f"Userbot fallback upload also failed: {inner_e}")
         
     # 5. Cleanup
     if os.path.exists(file_path):
@@ -581,16 +597,18 @@ async def _run_media_extractor(uid: int, cid: int, target_link: str, mode: str, 
         return
 
     app = Client(scraper_sessions[0], api_id=API_ID, api_hash=API_HASH, no_updates=True)
-    prog_resp = await _send_raw(cid, "🔄 <b>Connecting Scraper ID to extract media...</b>")
+    bot_uploader = Client("bot_uploader_temp", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True, no_updates=True)
+    
+    prog_resp = await _send_raw(cid, "🔄 <b>Connecting Scraper & Bot IDs to extract media...</b>")
     status_msg_id = prog_resp.get("result", {}).get("message_id") if isinstance(prog_resp, dict) else None
 
     try:
         await app.connect()
+        await bot_uploader.connect()
         try:
             chat = await app.get_chat(chat_id)
         except Exception as e:
             await _edit_raw(cid, status_msg_id, f"❌ <b>Scraper ID cannot access this chat!</b>\nError: {e}\n<i>Make sure the Scraper ID has joined the group/channel/bot.</i>")
-            await app.disconnect()
             return
 
         if "?start=" in target_link:
@@ -611,7 +629,7 @@ async def _run_media_extractor(uid: int, cid: int, target_link: str, mode: str, 
                 await _edit_raw(cid, status_msg_id, f"❌ <b>Error fetching message:</b> {single_e}")
                 return
                 
-            success = await process_and_send_media(app, msg, dest_id, cid, status_msg_id)
+            success = await process_and_send_media(app, bot_uploader, msg, dest_id, cid, status_msg_id)
             if success:
                 await _edit_raw(cid, status_msg_id, f"✅ <b>Successfully Extracted Single Post!</b>\nSent to Target ID: <code>{dest_id}</code>")
             else:
@@ -653,7 +671,7 @@ async def _run_media_extractor(uid: int, cid: int, target_link: str, mode: str, 
                     for msg in valid_msgs:
                         if msg.id >= current_msg_id:
                             if msg.text and msg.text.startswith("/start"): continue
-                            success = await process_and_send_media(app, msg, dest_id, cid, None)
+                            success = await process_and_send_media(app, bot_uploader, msg, dest_id, cid, None)
                             if success:
                                 extracted_count += 1
                                 if extracted_count % 5 == 0:
@@ -674,6 +692,8 @@ async def _run_media_extractor(uid: int, cid: int, target_link: str, mode: str, 
         logger.error(f"Extractor Error: {e}")
     finally:
         try: await app.disconnect()
+        except: pass
+        try: await bot_uploader.disconnect()
         except: pass
         EXTRACTOR_TASKS[uid] = False
 
