@@ -25,7 +25,7 @@ from pyrogram.raw.functions.messages import CheckChatInvite
 from pyrogram.raw.types import ChatInviteAlready, ChatInvite
 
 # ─────────────────────────────────────────
-#  CONFIG 
+#  CONFIG & INITIALIZATION
 # ─────────────────────────────────────────
 BOT_TOKEN = "8277915856:AAENwF3ByzZ7FKZ7CWLaxiVqCPtmgciEkQ4"
 API_ID    = 28980295
@@ -33,36 +33,79 @@ API_HASH  = "c378a9631b9adaf795fe9562c95dbd24"
 
 ADMIN_ID  = 8884734704
 
-# स्टोरेज चैनल/ग्रुप ID 
-STORAGE_CHANNEL_ID = -1004448809511   
-
-# बेसिक चैनल्स
-ACTIVE_CHANNEL_ID  = -1004458234660
-EXPIRED_CHANNEL_ID = -1003934489318
-FORWARD_ON_CHANNEL_ID = -1004340697685
-CHATTING_ON_CHANNEL_ID = -1003789944143
-SKIPPED_CHANNEL_ID = -1003934489318
-
-# मेंबर्स के अकॉर्डिंग चैनल्स
-MEMBERS_LESS_1000_ID = -1004494600592
-MEMBERS_1000_2500_ID = -1003701317207
-MEMBERS_2500_5000_ID = -1004320671631
-MEMBERS_5000_PLUS_ID = -1004320042078
-
-# ऐड मेंबर + चैटिंग/मीडिया चैनल्स
-ADD_MEMBER_TEXT_CHAT_ID = -1004334266609    
-ADD_MEMBER_MEDIA_CHAT_ID = -1004334266609  
-
+# Directories and Files
 SESSIONS_DIR  = "sessions"
 USERS_FILE = "users.txt"
 SCRAPER_STATE_FILE = "scraper_state.json"
 STORAGE_STATE_FILE = "storage_state.json"  
+CONFIG_FILE = "bot_config.json"
 
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 
 # VPS Logging
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────
+#  DYNAMIC CONFIGURATION SYSTEM
+# ─────────────────────────────────────────
+# Default Channels (will be used if config file doesn't exist)
+DEFAULT_CONFIG = {
+    "STORAGE_CHANNEL_ID": -1004448809511,
+    "ACTIVE_CHANNEL_ID": -1004458234660,
+    "EXPIRED_CHANNEL_ID": -1003934489318,
+    "FORWARD_ON_CHANNEL_ID": -1004340697685,
+    "CHATTING_ON_CHANNEL_ID": -1003789944143,
+    "SKIPPED_CHANNEL_ID": -1003934489318,
+    "MEMBERS_LESS_1000_ID": -1004494600592,
+    "MEMBERS_1000_2500_ID": -1003701317207,
+    "MEMBERS_2500_5000_ID": -1004320671631,
+    "MEMBERS_5000_PLUS_ID": -1004320042078,
+    "ADD_MEMBER_TEXT_CHAT_ID": -1004334266609,
+    "ADD_MEMBER_MEDIA_CHAT_ID": -1004334266609,
+    "EXTRACTOR_UPLOAD_ID": ADMIN_ID
+}
+
+CONFIG_NAMES = {
+    "STORAGE_CHANNEL_ID": "Storage Channel",
+    "ACTIVE_CHANNEL_ID": "Active Links",
+    "EXPIRED_CHANNEL_ID": "Expired Links",
+    "FORWARD_ON_CHANNEL_ID": "Forward ON",
+    "CHATTING_ON_CHANNEL_ID": "Chatting ON",
+    "SKIPPED_CHANNEL_ID": "Skipped Links",
+    "MEMBERS_LESS_1000_ID": "Members < 1000",
+    "MEMBERS_1000_2500_ID": "Members 1K - 2.5K",
+    "MEMBERS_2500_5000_ID": "Members 2.5K - 5K",
+    "MEMBERS_5000_PLUS_ID": "Members 5000+",
+    "ADD_MEMBER_TEXT_CHAT_ID": "Add Member + Text",
+    "ADD_MEMBER_MEDIA_CHAT_ID": "Add Member + Media",
+    "EXTRACTOR_UPLOAD_ID": "Extractor Upload Target"
+}
+
+def load_bot_config():
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                loaded = json.load(f)
+                # Merge with default to ensure missing keys are present
+                for k, v in DEFAULT_CONFIG.items():
+                    if k not in loaded:
+                        loaded[k] = v
+                return loaded
+        except Exception as e:
+            logger.error(f"Error loading config: {e}")
+    return DEFAULT_CONFIG.copy()
+
+def save_bot_config(config_data):
+    try:
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(config_data, f, indent=4)
+    except Exception as e:
+        logger.error(f"Error saving config: {e}")
+
+def get_conf(key: str) -> int:
+    cfg = load_bot_config()
+    return cfg.get(key, DEFAULT_CONFIG.get(key))
 
 # ─────────────────────────────────────────
 #  STATE & LOCKS & QUEUES
@@ -79,7 +122,7 @@ CHECKER_DUPLICATES = {}
 
 CHECKER_STATE = {}
 SCRAPER_TASKS = {}
-EXTRACTOR_TASKS = {} # New lock for media extractor
+EXTRACTOR_TASKS = {} 
 
 # ─────────────────────────────────────────
 #  JSON STATE LOADERS
@@ -188,7 +231,6 @@ def parse_link(link: str) -> tuple:
     if m: return False, m.group(1)
     return False, link
 
-# --- UPGRADED: PARSE MESSAGE LINKS FOR EXTRACTOR (BOT DEEP-LINK SAFE) ---
 def parse_msg_link(link: str):
     link = link.strip().rstrip("/")
     try:
@@ -362,7 +404,7 @@ async def try_check_link(app: Client, link: str):
             return result, True, 0
 
 # ─────────────────────────────────────────
-#  INSTANT SENDER & ROUTING
+#  INSTANT SENDER & ROUTING (Dynamic IDs)
 # ─────────────────────────────────────────
 async def _send_raw(chat_id: int, text: str, keyboard=None, retries=3):
     if not chat_id or chat_id == 0: return False
@@ -403,11 +445,11 @@ async def dispatch_result(r: dict, stats_tracker: dict):
     msg = format_single_message(r)
     
     if r["status"] == "active":
-        await _send_raw(ACTIVE_CHANNEL_ID, f"<b>✅ ACTIVE LINK</b>\n━━━━━━━━━━\n{msg}")
+        await _send_raw(get_conf("ACTIVE_CHANNEL_ID"), f"<b>✅ ACTIVE LINK</b>\n━━━━━━━━━━\n{msg}")
         
         if "✅" in r.get("forward", ""):
             stats_tracker["fwd"] += 1
-            await _send_raw(FORWARD_ON_CHANNEL_ID, f"<b>✅ FORWARD ON LINK</b>\n━━━━━━━━━━\n{msg}")
+            await _send_raw(get_conf("FORWARD_ON_CHANNEL_ID"), f"<b>✅ FORWARD ON LINK</b>\n━━━━━━━━━━\n{msg}")
             
         is_chat_on = "✅" in r.get("chatting", "")
         is_add_on = "✅" in r.get("add_member", "")
@@ -415,36 +457,36 @@ async def dispatch_result(r: dict, stats_tracker: dict):
         
         if is_chat_on:
             stats_tracker["chat"] += 1
-            await _send_raw(CHATTING_ON_CHANNEL_ID, f"<b>💬 CHATTING ON LINK</b>\n━━━━━━━━━━\n{msg}")
+            await _send_raw(get_conf("CHATTING_ON_CHANNEL_ID"), f"<b>💬 CHATTING ON LINK</b>\n━━━━━━━━━━\n{msg}")
             try:
                 m_count = int(r.get("members", 0)) if r.get("members") != "N/A" else 0
                 if m_count < 1000:
-                    await _send_raw(MEMBERS_LESS_1000_ID, f"<b>👥 < 1000 MEMBERS (CHAT ON)</b>\n━━━━━━━━━━\n{msg}")
+                    await _send_raw(get_conf("MEMBERS_LESS_1000_ID"), f"<b>👥 < 1000 MEMBERS (CHAT ON)</b>\n━━━━━━━━━━\n{msg}")
                 elif 1000 <= m_count <= 2500:
-                    await _send_raw(MEMBERS_1000_2500_ID, f"<b>👥 1000-2500 MEMBERS (CHAT ON)</b>\n━━━━━━━━━━\n{msg}")
+                    await _send_raw(get_conf("MEMBERS_1000_2500_ID"), f"<b>👥 1000-2500 MEMBERS (CHAT ON)</b>\n━━━━━━━━━━\n{msg}")
                 elif 2500 < m_count <= 5000:
-                    await _send_raw(MEMBERS_2500_5000_ID, f"<b>👥 2500-5000 MEMBERS (CHAT ON)</b>\n━━━━━━━━━━\n{msg}")
+                    await _send_raw(get_conf("MEMBERS_2500_5000_ID"), f"<b>👥 2500-5000 MEMBERS (CHAT ON)</b>\n━━━━━━━━━━\n{msg}")
                 elif m_count > 5000:
-                    await _send_raw(MEMBERS_5000_PLUS_ID, f"<b>👥 5000+ MEMBERS (CHAT ON)</b>\n━━━━━━━━━━\n{msg}")
+                    await _send_raw(get_conf("MEMBERS_5000_PLUS_ID"), f"<b>👥 5000+ MEMBERS (CHAT ON)</b>\n━━━━━━━━━━\n{msg}")
             except Exception:
                 pass
                 
         if is_add_on:
             if is_chat_on:
                 stats_tracker["add_chat"] += 1
-                await _send_raw(ADD_MEMBER_TEXT_CHAT_ID, f"<b>➕ ADD MEMBER & TEXT CHAT ON</b>\n━━━━━━━━━━\n{msg}")
+                await _send_raw(get_conf("ADD_MEMBER_TEXT_CHAT_ID"), f"<b>➕ ADD MEMBER & TEXT CHAT ON</b>\n━━━━━━━━━━\n{msg}")
             elif is_media_only:
                 stats_tracker.setdefault("add_media", 0)
                 stats_tracker["add_media"] += 1
-                await _send_raw(ADD_MEMBER_MEDIA_CHAT_ID, f"<b>➕ ADD MEMBER & MEDIA ONLY ON</b>\n━━━━━━━━━━\n{msg}")
+                await _send_raw(get_conf("ADD_MEMBER_MEDIA_CHAT_ID"), f"<b>➕ ADD MEMBER & MEDIA ONLY ON</b>\n━━━━━━━━━━\n{msg}")
                 
     elif r["status"] == "expired":
-        await _send_raw(EXPIRED_CHANNEL_ID, f"<b>❌ EXPIRED LINK</b>\n━━━━━━━━━━\n{msg}")
+        await _send_raw(get_conf("EXPIRED_CHANNEL_ID"), f"<b>❌ EXPIRED LINK</b>\n━━━━━━━━━━\n{msg}")
     elif r["status"] == "skipped":
-        await _send_raw(SKIPPED_CHANNEL_ID, f"<b>⚠️ SKIPPED LINK</b>\n━━━━━━━━━━\n{msg}")
+        await _send_raw(get_conf("SKIPPED_CHANNEL_ID"), f"<b>⚠️ SKIPPED LINK</b>\n━━━━━━━━━━\n{msg}")
 
 # ─────────────────────────────────────────
-#  UPGRADED: RESTRICTED MEDIA EXTRACTOR (SINGLE, BULK & BOT DEEP-LINKS)
+#  MEDIA EXTRACTOR (WITH is_premium BUG FIX)
 # ─────────────────────────────────────────
 async def process_and_send_media(app, msg, dest_id, cid, status_msg_id=None):
     if not msg or msg.empty: return False
@@ -455,7 +497,17 @@ async def process_and_send_media(app, msg, dest_id, cid, status_msg_id=None):
             if status_msg_id:
                 await _edit_raw(cid, status_msg_id, "📥 <b>Downloading restricted media to VPS...</b>\n<i>Please wait, this might take time depending on file size.</i>")
             
-            file_path = await app.download_media(msg)
+            # --- FIX FOR 'is_premium' ERROR ---
+            try:
+                file_path = await app.download_media(msg)
+            except Exception as dl_e:
+                if "is_premium" in str(dl_e):
+                    logger.warning(f"Ignored 'is_premium' internal Pyrogram bug during download_media for msg {msg.id}")
+                    # If download fails due to Pyrogram internal bug on anonymous users, we skip gracefully.
+                    return False
+                else:
+                    raise dl_e
+            
             if not file_path: return False
 
             if status_msg_id:
@@ -480,12 +532,22 @@ async def process_and_send_media(app, msg, dest_id, cid, status_msg_id=None):
                 await msg.copy(dest_id)
                 return True
             except Exception as inner_e:
-                logger.error(f"Copy failed ({inner_e}), triggering fallback manual download...")
+                # --- FIX FOR 'is_premium' ERROR during copy ---
+                if "is_premium" in str(inner_e):
+                    logger.warning(f"Ignored 'is_premium' bug during copy. Forcing download fallback.")
+                else:
+                    logger.error(f"Copy failed ({inner_e}), triggering fallback manual download...")
                 
                 if status_msg_id:
                     await _edit_raw(cid, status_msg_id, "📥 <b>Handling copy error, downloading media to VPS...</b>\n<i>Please wait...</i>")
                 
-                file_path = await app.download_media(msg)
+                try:
+                    file_path = await app.download_media(msg)
+                except Exception as dl_e2:
+                    if "is_premium" in str(dl_e2):
+                        return False
+                    raise dl_e2
+
                 if not file_path:
                     if msg.text:
                         await app.send_message(dest_id, text=msg.text)
@@ -511,13 +573,14 @@ async def process_and_send_media(app, msg, dest_id, cid, status_msg_id=None):
         await asyncio.sleep(e.value + 2)
         return False
     except Exception as e:
+        # Final catch to prevent crashing the loop
         logger.error(f"Error processing media: {e}")
         return False
 
 async def _run_media_extractor(uid: int, cid: int, target_link: str, mode: str, dest_id: int):
     scraper_sessions = get_user_sessions(uid, "scraper")
     if not scraper_sessions:
-        await _send_raw(cid, "❌ <b>No Scraper ID logged in!</b>\nPlease add an account in Scraper Menu first.")
+        await _send_raw(cid, "❌ <b>No Scraper ID logged in!</b>\nPlease add an account in Link Pro -> Scraper Menu first.")
         return
 
     chat_id, start_msg_id = parse_msg_link(target_link)
@@ -540,7 +603,6 @@ async def _run_media_extractor(uid: int, cid: int, target_link: str, mode: str, 
             await app.disconnect()
             return
 
-        # --- NEW SMART BOT DEEP-LINK HANDLER ---
         if "?start=" in target_link:
             try:
                 payload = target_link.split("?start=")[1].split("&")[0]
@@ -557,9 +619,9 @@ async def _run_media_extractor(uid: int, cid: int, target_link: str, mode: str, 
             msg = await app.get_messages(chat.id, start_msg_id)
             success = await process_and_send_media(app, msg, dest_id, cid, status_msg_id)
             if success:
-                await _edit_raw(cid, status_msg_id, f"✅ <b>Successfully Extracted Single Post!</b>\nSent to: <code>{dest_id}</code>")
+                await _edit_raw(cid, status_msg_id, f"✅ <b>Successfully Extracted Single Post!</b>\nSent to Target ID: <code>{dest_id}</code>")
             else:
-                await _edit_raw(cid, status_msg_id, "❌ <b>Failed to extract media.</b> (Message might be deleted or unsupported type)")
+                await _edit_raw(cid, status_msg_id, "❌ <b>Failed to extract media.</b> (Message might be deleted, unsupported, or blocked by Pyrogram bug)")
 
         elif mode == "bulk":
             await _edit_raw(cid, status_msg_id, f"🔄 <b>Starting Bulk Extraction...</b>\nFrom Message ID: <code>{start_msg_id}</code> onwards.\n<i>Sending to: {dest_id}</i>")
@@ -599,7 +661,7 @@ async def _run_media_extractor(uid: int, cid: int, target_link: str, mode: str, 
                 except Exception as e:
                     break
 
-            await _edit_raw(cid, status_msg_id, f"✅ <b>Bulk Extraction Complete!</b>\nTotal Extracted: <code>{extracted_count}</code> posts.")
+            await _edit_raw(cid, status_msg_id, f"✅ <b>Bulk Extraction Complete!</b>\nTotal Extracted: <code>{extracted_count}</code> posts.\nSent to: <code>{dest_id}</code>")
 
     except Exception as e:
         if status_msg_id:
@@ -611,7 +673,7 @@ async def _run_media_extractor(uid: int, cid: int, target_link: str, mode: str, 
         EXTRACTOR_TASKS[uid] = False
 
 # ─────────────────────────────────────────
-#  SCRAPER & AUTO-UPDATES (SMART MEMORY)
+#  SCRAPER & AUTO-UPDATES
 # ─────────────────────────────────────────
 async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True):
     scraper_sessions = get_user_sessions(uid, "scraper")
@@ -696,7 +758,7 @@ async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True):
                         send_chunk = chunk_links[i:i+50]
                         text_to_send = "\n".join(send_chunk)
                         try:
-                            await _send_raw(STORAGE_CHANNEL_ID, text_to_send)
+                            await _send_raw(get_conf("STORAGE_CHANNEL_ID"), text_to_send)
                         except: pass
                         await asyncio.sleep(1)
                         
@@ -838,7 +900,7 @@ async def _update_dashboard_if_needed(uid: int, force=False):
     except: pass
 
 # ─────────────────────────────────────────
-#  BULK RUNNER WITH QUEUE (AUTO STORAGE PULL)
+#  BULK RUNNER WITH QUEUE 
 # ─────────────────────────────────────────
 async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False):
     QUEUE_CONTROL[uid] = "running"
@@ -900,7 +962,7 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False
                     try:
                         c_app = CHECKER_STATE[uid]["clients"][client_keys[0]]["app"]
                         msg_ids_to_fetch = list(range(storage_last_msg_id, storage_last_msg_id + 50))
-                        messages = await c_app.get_messages(STORAGE_CHANNEL_ID, msg_ids_to_fetch)
+                        messages = await c_app.get_messages(get_conf("STORAGE_CHANNEL_ID"), msg_ids_to_fetch)
                         
                         links_found_in_batch = False
                         
@@ -911,7 +973,7 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False
                             
                             for l in links:
                                 if l not in CHECKER_DUPLICATES[uid]:
-                                    USER_QUEUES[uid].append({"link": l, "message_id": msg.id, "chat_id": STORAGE_CHANNEL_ID})
+                                    USER_QUEUES[uid].append({"link": l, "message_id": msg.id, "chat_id": get_conf("STORAGE_CHANNEL_ID")})
                                     CHECKER_DUPLICATES[uid].add(l)
                                     links_found_in_batch = True
                                     if not fetched_msg: 
@@ -924,7 +986,7 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False
                             empty_storage_batches = 0
                             if fetched_msg:
                                 current_pinned_msg_id = fetched_msg.id
-                                await _pin_message(STORAGE_CHANNEL_ID, fetched_msg.id)
+                                await _pin_message(get_conf("STORAGE_CHANNEL_ID"), fetched_msg.id)
                         else:
                             empty_storage_batches += 1
                             
@@ -1052,7 +1114,7 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False
     print(f"[{datetime.now()}] ✅ Bulk Check Queue Completed/Stopped for UID: {uid}")
 
 # ─────────────────────────────────────────
-#  UI & UTILS
+#  UI & UTILS (Separated Menus)
 # ─────────────────────────────────────────
 async def _edit_raw(chat_id, message_id, text, keyboard=None):
     payload = {"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
@@ -1061,8 +1123,9 @@ async def _edit_raw(chat_id, message_id, text, keyboard=None):
 
 def START_KB():
     return [
-        [{"text": "🔍 Link Without Account (Fast Check)", "callback_data": "menu_guest"}],
-        [{"text": "👑 Link Pro (Advanced Dashboard)", "callback_data": "menu_pro"}]
+        [{"text": "🔍 Normal Link Checker", "callback_data": "menu_guest"}],
+        [{"text": "👑 Link Checker Pro (Advanced)", "callback_data": "menu_pro"}],
+        [{"text": "🎥 Media Extractor (Bot Recover)", "callback_data": "menu_extractor_main"}]
     ]
 
 def PRO_KB(uid):
@@ -1071,10 +1134,18 @@ def PRO_KB(uid):
     return [
         [{"text": f"🏦 Checker Bank ({len(checker_sessions)} Active)", "callback_data": "menu_accounts"}],
         [{"text": f"🕷️ Scraper Accounts & Targets ({len(scraper_sessions)} Active)", "callback_data": "menu_scraper"}],
-        [{"text": "🎥 Media Extractor (Restricted)", "callback_data": "menu_extractor"}], 
         [{"text": "📥 Trigger Smart Scrape Now", "callback_data": "scraper_today"}],
-        [{"text": "🔗 Check Links (Manual)", "callback_data": "menu_check"}],
-        [{"text": "⚙️ Settings", "callback_data": "menu_settings"}],
+        [{"text": "🔗 Check Links (Manual Mode)", "callback_data": "menu_check"}],
+        [{"text": "⚙️ Checker Settings (Delay)", "callback_data": "menu_settings"}],
+        [{"text": "⚙️ Channel Configurations", "callback_data": "menu_config_checker"}],
+        [{"text": "🔙 Back", "callback_data": "back_start"}]
+    ]
+
+def EXTRACTOR_KB():
+    return [
+        [{"text": "📌 Extract Single Post", "callback_data": "ext_single"}],
+        [{"text": "📚 Extract Bulk (All below link)", "callback_data": "ext_bulk"}],
+        [{"text": "⚙️ Set Target/Upload Channel", "callback_data": "menu_config_extractor"}],
         [{"text": "🔙 Back", "callback_data": "back_start"}]
     ]
 
@@ -1086,7 +1157,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     track_user(uid)
     ctx.user_data["mode"] = ""
     await cleanup_login_state(uid)
-    text = f"👋 <b>Welcome {update.effective_user.first_name}</b>\n\nAdvanced Link Checker & Scraper Bot.\nChoose an option below:"
+    text = f"👋 <b>Welcome {update.effective_user.first_name}</b>\n\nAdvanced Link Checker & Extractor Bot.\nChoose an option below:"
     await _send_raw(update.effective_chat.id, text, START_KB())
 
 async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1111,26 +1182,50 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data["mode"] = ""
         state = load_scraper_state(uid)
         daily_stats = state.get("daily_stats", 0)
-        await _edit_raw(cid, mid, f"👑 <b>Link Pro Dashboard</b>\n\n📊 <b>Scraping Status Today:</b> {daily_stats} Links Extracted\n\nWelcome to the advanced menu. Automate your work seamlessly.", PRO_KB(uid))
+        await _edit_raw(cid, mid, f"👑 <b>Link Checker Pro</b>\n\n📊 <b>Scraping Status Today:</b> {daily_stats} Links Extracted\n\nManage Checkers, Scrapers and Channels here.", PRO_KB(uid))
 
-    elif d == "menu_extractor":
-        kb = [
-            [{"text": "📌 Extract Single Post", "callback_data": "ext_single"}],
-            [{"text": "📚 Extract Bulk (All below link)", "callback_data": "ext_bulk"}],
-            [{"text": "🔙 Back", "callback_data": "menu_pro"}]
-        ]
-        await _edit_raw(cid, mid, "🎥 <b>Restricted Media Extractor</b>\n\nChoose extraction mode:\n\n"
-                                  "1. <b>Single Post:</b> Extracts only the specific message link you provide.\n"
-                                  "2. <b>Bulk:</b> Extracts the provided message AND all messages posted after it.\n\n"
-                                  "<i>Note: Media will be downloaded by Scraper ID and sent to your Admin ID.</i>", kb)
+    elif d == "menu_extractor_main":
+        ctx.user_data["mode"] = ""
+        await _edit_raw(cid, mid, "🎥 <b>Restricted Media Extractor</b>\n\nUse this to download restricted media from Bots, Groups or Channels and upload them to your set Target Channel.\n\n<i>Requires Scraper ID to be logged in (via Link Pro menu).</i>", EXTRACTOR_KB())
 
     elif d == "ext_single":
         ctx.user_data["mode"] = "ext_single_wait"
-        await _edit_raw(cid, mid, "📌 <b>Single Post Extraction</b>\n\nSend the exact message link (e.g. `t.me/c/123456/789`).\n\n<i>Make sure your Scraper ID has joined the target group/bot!</i>", [[{"text": "🔙 Cancel", "callback_data": "menu_extractor"}]])
+        await _edit_raw(cid, mid, "📌 <b>Single Post Extraction</b>\n\nSend the exact message link (e.g. `t.me/c/123456/789`).\n\n<i>Make sure your Scraper ID has joined the target group/bot!</i>", [[{"text": "🔙 Cancel", "callback_data": "menu_extractor_main"}]])
 
     elif d == "ext_bulk":
         ctx.user_data["mode"] = "ext_bulk_wait"
-        await _edit_raw(cid, mid, "📚 <b>Bulk Post Extraction</b>\n\nSend the STARTING message link.\nBot will extract that message and ALL messages posted after it sequentially.\n\n<i>Make sure your Scraper ID has joined!</i>", [[{"text": "🔙 Cancel", "callback_data": "menu_extractor"}]])
+        await _edit_raw(cid, mid, "📚 <b>Bulk Post Extraction</b>\n\nSend the STARTING message link.\nBot will extract that message and ALL messages posted after it sequentially.\n\n<i>Make sure your Scraper ID has joined!</i>", [[{"text": "🔙 Cancel", "callback_data": "menu_extractor_main"}]])
+
+    # --- DYNAMIC CONFIGURATIONS MENUS ---
+    elif d == "menu_config_checker":
+        kb = []
+        cfg = load_bot_config()
+        # Filter only checker related configs
+        checker_keys = [k for k in CONFIG_NAMES.keys() if k != "EXTRACTOR_UPLOAD_ID"]
+        for k in checker_keys:
+            val_str = str(cfg.get(k, DEFAULT_CONFIG[k]))
+            # Make shorter for display
+            if len(val_str) > 10: val_str = val_str[:4] + ".." + val_str[-4:]
+            name = CONFIG_NAMES[k]
+            kb.append([{"text": f"{name}: {val_str}", "callback_data": f"setcfg_{k}"}])
+        kb.append([{"text": "🔙 Back", "callback_data": "menu_pro"}])
+        
+        await _edit_raw(cid, mid, "⚙️ <b>Channel Configurations (Checker)</b>\n\nClick any button below to change its Channel ID.", kb)
+
+    elif d == "menu_config_extractor":
+        cfg = load_bot_config()
+        val = cfg.get("EXTRACTOR_UPLOAD_ID", DEFAULT_CONFIG["EXTRACTOR_UPLOAD_ID"])
+        kb = [
+            [{"text": f"Change Target (Current: {val})", "callback_data": "setcfg_EXTRACTOR_UPLOAD_ID"}],
+            [{"text": "🔙 Back", "callback_data": "menu_extractor_main"}]
+        ]
+        await _edit_raw(cid, mid, "⚙️ <b>Extractor Channel Config</b>\n\nSet the Channel/Group ID where Extracted Media will be uploaded.", kb)
+
+    elif d.startswith("setcfg_"):
+        cfg_key = d.split("setcfg_")[1]
+        ctx.user_data["mode"] = f"waiting_cfg_{cfg_key}"
+        cfg_name = CONFIG_NAMES.get(cfg_key, cfg_key)
+        await _edit_raw(cid, mid, f"✍️ <b>Update {cfg_name}</b>\n\nPlease send the new Channel/Group ID (must include -100 if it's a channel).\n\n<i>Send /cancel to abort.</i>")
 
     elif d.startswith("tog_id_"):
         c_key = d.split("tog_id_")[1]
@@ -1208,7 +1303,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     elif d == "scraper_add_target":
         ctx.user_data["mode"] = "scraper_target"
-        await _edit_raw(cid, mid, "🎯 <b>Add New Scraper Target</b>\n\nYou can:\n1. Forward any message from the Group/Channel here.\n2. Send the Chat ID (e.g. `-10012345678`)\n3. <b>[NEW]</b> Paste a Message Link (e.g. `t.me/c/12345/67` or `t.me/joinchat/...`)", [[{"text": "🔙 Cancel", "callback_data": "menu_scraper"}]])
+        await _edit_raw(cid, mid, "🎯 <b>Add New Scraper Target</b>\n\nYou can:\n1. Forward any message from the Group/Channel here.\n2. Send the Chat ID (e.g. `-10012345678`)\n3. Paste a Message Link (e.g. `t.me/c/12345/67` or `t.me/joinchat/...`)", [[{"text": "🔙 Cancel", "callback_data": "menu_scraper"}]])
 
     elif d == "scraper_rem_target":
         state = load_scraper_state(uid)
@@ -1303,8 +1398,35 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or update.message.caption or "").strip()
     mode = ctx.user_data.get("mode", "")
 
-    if text == "/start": return 
+    if text == "/start" or text == "/cancel": 
+        ctx.user_data["mode"] = ""
+        await update.message.reply_text("Action cancelled. Use /start again.")
+        return 
 
+    # --- DYNAMIC CONFIG HANDLER ---
+    if mode.startswith("waiting_cfg_"):
+        cfg_key = mode.replace("waiting_cfg_", "")
+        try:
+            new_id = int(text)
+            config_data = load_bot_config()
+            config_data[cfg_key] = new_id
+            save_bot_config(config_data)
+            
+            ctx.user_data["mode"] = ""
+            cfg_name = CONFIG_NAMES.get(cfg_key, cfg_key)
+            
+            # Send success and return button depending on where they came from
+            if cfg_key == "EXTRACTOR_UPLOAD_ID":
+                kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Config", callback_data="menu_config_extractor")]])
+            else:
+                kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Config", callback_data="menu_config_checker")]])
+            
+            await update.message.reply_text(f"✅ <b>Success!</b>\n\n{cfg_name} has been updated to:\n<code>{new_id}</code>", parse_mode="HTML", reply_markup=kb)
+        except ValueError:
+            await update.message.reply_text("❌ Invalid ID format. Please send a valid numeric Channel/Group ID (e.g. -1001234567).")
+        return
+
+    # --- EXTRACTOR HANDLER ---
     if mode in ["ext_single_wait", "ext_bulk_wait"]:
         if EXTRACTOR_TASKS.get(uid):
             await update.message.reply_text("⚠️ Extraction already running. Please wait.")
@@ -1318,9 +1440,12 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ext_mode = "single" if mode == "ext_single_wait" else "bulk"
         ctx.user_data["mode"] = "" 
         
-        asyncio.create_task(_run_media_extractor(uid, cid, text, ext_mode, ADMIN_ID))
+        # Use dynamic upload ID
+        target_upload_id = get_conf("EXTRACTOR_UPLOAD_ID")
+        asyncio.create_task(_run_media_extractor(uid, cid, text, ext_mode, target_upload_id))
         return
 
+    # --- OTHER HANDLERS ---
     if mode == "guest_check":
         links = extract_links(text)
         if not links:
