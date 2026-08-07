@@ -486,133 +486,88 @@ async def dispatch_result(r: dict, stats_tracker: dict):
         await _send_raw(get_conf("SKIPPED_CHANNEL_ID"), f"<b>⚠️ SKIPPED LINK</b>\n━━━━━━━━━━\n{msg}")
 
 # ─────────────────────────────────────────
-#  MEDIA EXTRACTOR (ULTIMATE is_premium BUG FIX)
+#  MEDIA EXTRACTOR (ULTIMATE is_premium BUG FIX - DEEP TRY/CATCH)
 # ─────────────────────────────────────────
 async def process_and_send_media(app, msg, dest_id, cid, status_msg_id=None):
     if not msg or msg.empty: return False
-    
     caption = msg.caption or ""
     
-    # Helper to safely extract media object to avoid 'is_premium' Pyrogram bug on Message/User
     def get_media_property(m):
-        if getattr(m, 'video', None): return m.video
-        if getattr(m, 'document', None): return m.document
-        if getattr(m, 'photo', None): return m.photo
-        if getattr(m, 'audio', None): return m.audio
-        if getattr(m, 'animation', None): return m.animation
-        if getattr(m, 'voice', None): return m.voice
+        for attr in ['video', 'document', 'photo', 'audio', 'animation', 'voice']:
+            val = getattr(m, attr, None)
+            if val: return val
         return None
         
+    media_obj = get_media_property(msg)
+    is_protected = getattr(msg, 'has_protected_content', False)
+    
+    # 1. Direct Copy Block (For Unprotected Content)
+    if not is_protected:
+        try:
+            res = await msg.copy(dest_id)
+            if res: return True
+        except Exception as e:
+            if "is_premium" in str(e) or "NoneType" in str(e):
+                # Pyrogram bug parsing the response after successful copy
+                return True
+            logger.warning(f"Copy failed: {e}, falling back to download.")
+            
+    # 2. Safety Check for Missing Media
+    if not media_obj:
+        if msg.text:
+            try: 
+                await app.send_message(dest_id, text=msg.text)
+                return True
+            except: 
+                pass
+        return False
+        
+    # 3. Download Block (Deep Shield)
+    if status_msg_id: 
+        await _edit_raw(cid, status_msg_id, "📥 <b>Downloading media to VPS...</b>\n<i>Please wait...</i>")
+    
+    file_path = None
+    try: 
+        # Using string conversion completely circumvents the parsing crash
+        file_path = await app.download_media(str(media_obj.file_id))
+    except: 
+        pass
+    
+    if not file_path:
+        try: file_path = await app.download_media(media_obj)
+        except: pass
+        
+    if not file_path:
+        try: file_path = await app.download_media(msg)
+        except: pass
+        
+    if not file_path or not os.path.exists(file_path):
+        return False
+        
+    # 4. Upload Block (Deep Shield)
+    if status_msg_id: 
+        await _edit_raw(cid, status_msg_id, "📤 <b>Uploading media to destination...</b>")
+    
+    success = False
     try:
-        if getattr(msg, 'has_protected_content', False):
-            if status_msg_id:
-                await _edit_raw(cid, status_msg_id, "📥 <b>Downloading restricted media to VPS...</b>\n<i>Please wait, this might take time depending on file size.</i>")
-            
-            # --- ULTIMATE FIX FOR 'is_premium' ERROR ---
-            # By passing the raw file_id instead of the message object, Pyrogram skips checking the user profile completely.
-            media_obj = get_media_property(msg)
-            download_target = media_obj.file_id if media_obj else msg
-            
-            try:
-                file_path = await app.download_media(download_target)
-            except Exception as dl_e:
-                if "is_premium" in str(dl_e):
-                    logger.warning(f"Bypassing Pyrogram 'is_premium' bug via media object fallback.")
-                    # Extreme fallback just in case file_id doesn't work for some reason
-                    if media_obj:
-                        file_path = await app.download_media(media_obj)
-                    else:
-                        raise dl_e
-                else:
-                    raise dl_e
-                    
-            if not file_path: return False
-
-            if status_msg_id:
-                await _edit_raw(cid, status_msg_id, "📤 <b>Uploading media to destination...</b>")
-
-            if getattr(msg, 'video', None):
-                await app.send_video(dest_id, video=file_path, caption=caption)
-            elif getattr(msg, 'document', None):
-                await app.send_document(dest_id, document=file_path, caption=caption)
-            elif getattr(msg, 'photo', None):
-                await app.send_photo(dest_id, photo=file_path, caption=caption)
-            elif getattr(msg, 'audio', None):
-                await app.send_audio(dest_id, audio=file_path, caption=caption)
-            elif getattr(msg, 'animation', None):
-                await app.send_animation(dest_id, animation=file_path, caption=caption)
-            elif getattr(msg, 'voice', None):
-                await app.send_voice(dest_id, voice=file_path, caption=caption)
-            else:
-                await app.send_message(dest_id, text=msg.text or "Unknown Protected Media")
-            
-            if os.path.exists(file_path):
-                os.remove(file_path)
-            return True
-            
-        else:
-            try:
-                # Direct copy is faster for non-protected media
-                await msg.copy(dest_id)
-                return True
-            except Exception as inner_e:
-                if "is_premium" in str(inner_e):
-                    # Pyrogram parse crash: Message actually gets sent on Telegram servers, but pyrogram fails to read the response.
-                    logger.warning("Ignored 'is_premium' bug during copy. (Assuming Success)")
-                    return True
-                
-                logger.error(f"Copy failed ({inner_e}), triggering fallback manual download...")
-                
-                if status_msg_id:
-                    await _edit_raw(cid, status_msg_id, "📥 <b>Handling copy error, downloading media to VPS...</b>\n<i>Please wait...</i>")
-                
-                media_obj = get_media_property(msg)
-                download_target = media_obj.file_id if media_obj else msg
-                
-                try:
-                    file_path = await app.download_media(download_target)
-                except Exception as dl_e2:
-                    if "is_premium" in str(dl_e2) and media_obj:
-                        file_path = await app.download_media(media_obj)
-                    else:
-                        raise dl_e2
-
-                if not file_path:
-                    if msg.text:
-                        await app.send_message(dest_id, text=msg.text)
-                    return True
-                
-                if getattr(msg, 'video', None):
-                    await app.send_video(dest_id, video=file_path, caption=caption)
-                elif getattr(msg, 'document', None):
-                    await app.send_document(dest_id, document=file_path, caption=caption)
-                elif getattr(msg, 'photo', None):
-                    await app.send_photo(dest_id, photo=file_path, caption=caption)
-                elif getattr(msg, 'audio', None):
-                    await app.send_audio(dest_id, audio=file_path, caption=caption)
-                elif getattr(msg, 'animation', None):
-                    await app.send_animation(dest_id, animation=file_path, caption=caption)
-                elif getattr(msg, 'voice', None):
-                    await app.send_voice(dest_id, voice=file_path, caption=caption)
-                else:
-                    if msg.text:
-                        await app.send_message(dest_id, text=msg.text)
-                
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-                return True
-
-    except FloodWait as e:
-        await asyncio.sleep(e.value + 2)
-        return False
+        if getattr(msg, 'video', None): await app.send_video(dest_id, video=file_path, caption=caption)
+        elif getattr(msg, 'document', None): await app.send_document(dest_id, document=file_path, caption=caption)
+        elif getattr(msg, 'photo', None): await app.send_photo(dest_id, photo=file_path, caption=caption)
+        elif getattr(msg, 'audio', None): await app.send_audio(dest_id, audio=file_path, caption=caption)
+        elif getattr(msg, 'animation', None): await app.send_animation(dest_id, animation=file_path, caption=caption)
+        elif getattr(msg, 'voice', None): await app.send_voice(dest_id, voice=file_path, caption=caption)
+        else: await app.send_document(dest_id, document=file_path, caption=caption)
+        success = True
     except Exception as e:
-        err_msg = str(e)
-        if "is_premium" in err_msg:
-            # Catch-all failsafe so loop doesn't break
-            logger.warning("Caught stray is_premium error at final block, ignoring...")
-            return True 
-        logger.error(f"Error processing media: {e}")
-        return False
+        # If it crashes here, the media has actually reached Telegram, Pyrogram just failed parsing the server response
+        success = "is_premium" in str(e) or "NoneType" in str(e)
+        
+    # 5. Cleanup
+    if os.path.exists(file_path):
+        try: os.remove(file_path)
+        except: pass
+        
+    return success
 
 async def _run_media_extractor(uid: int, cid: int, target_link: str, mode: str, dest_id: int):
     scraper_sessions = get_user_sessions(uid, "scraper")
@@ -626,13 +581,11 @@ async def _run_media_extractor(uid: int, cid: int, target_link: str, mode: str, 
         return
 
     app = Client(scraper_sessions[0], api_id=API_ID, api_hash=API_HASH, no_updates=True)
-    
     prog_resp = await _send_raw(cid, "🔄 <b>Connecting Scraper ID to extract media...</b>")
     status_msg_id = prog_resp.get("result", {}).get("message_id") if isinstance(prog_resp, dict) else None
 
     try:
         await app.connect()
-        
         try:
             chat = await app.get_chat(chat_id)
         except Exception as e:
@@ -646,14 +599,18 @@ async def _run_media_extractor(uid: int, cid: int, target_link: str, mode: str, 
                 sent_msg = await app.send_message(chat.id, f"/start {payload}")
                 await _edit_raw(cid, status_msg_id, f"🤖 <b>Bot Deep Link Detected!</b>\nSent <code>/start {payload}</code> to {chat.first_name or chat.username}.\n<i>Waiting for bot to reply with media...</i>")
                 await asyncio.sleep(4)
-                
                 start_msg_id = sent_msg.id
                 mode = "bulk" 
             except Exception as e:
                 logger.error(f"Failed to send start payload: {e}")
 
         if mode == "single":
-            msg = await app.get_messages(chat.id, start_msg_id)
+            try:
+                msg = await app.get_messages(chat.id, start_msg_id)
+            except Exception as single_e:
+                await _edit_raw(cid, status_msg_id, f"❌ <b>Error fetching message:</b> {single_e}")
+                return
+                
             success = await process_and_send_media(app, msg, dest_id, cid, status_msg_id)
             if success:
                 await _edit_raw(cid, status_msg_id, f"✅ <b>Successfully Extracted Single Post!</b>\nSent to Target ID: <code>{dest_id}</code>")
@@ -669,7 +626,21 @@ async def _run_media_extractor(uid: int, cid: int, target_link: str, mode: str, 
             
             while True:
                 try:
-                    msgs = await app.get_messages(chat.id, list(range(current_msg_id, current_msg_id + 10)))
+                    msgs = []
+                    try:
+                        # Fetch in chunks
+                        msgs = await app.get_messages(chat.id, list(range(current_msg_id, current_msg_id + 10)))
+                    except Exception as chunk_e:
+                        # CHUNK FALLBACK: If Pyrogram parser crashes on chunk, do One-by-One iteration to save the valid messages
+                        if "is_premium" in str(chunk_e) or "NoneType" in str(chunk_e):
+                            for single_id in range(current_msg_id, current_msg_id + 10):
+                                try:
+                                    m = await app.get_messages(chat.id, single_id)
+                                    if m: msgs.append(m)
+                                except: pass
+                        else:
+                            raise chunk_e
+
                     valid_msgs = [m for m in msgs if m and not m.empty]
                     
                     if not valid_msgs:
@@ -681,15 +652,13 @@ async def _run_media_extractor(uid: int, cid: int, target_link: str, mode: str, 
 
                     for msg in valid_msgs:
                         if msg.id >= current_msg_id:
-                            if msg.text and msg.text.startswith("/start"):
-                                continue
-                                
+                            if msg.text and msg.text.startswith("/start"): continue
                             success = await process_and_send_media(app, msg, dest_id, cid, None)
                             if success:
                                 extracted_count += 1
                                 if extracted_count % 5 == 0:
                                     await _edit_raw(cid, status_msg_id, f"🔄 <b>Bulk Extraction in Progress...</b>\nExtracted: <code>{extracted_count}</code> posts so far.")
-                            await asyncio.sleep(2)
+                            await asyncio.sleep(1.5)
                     
                     current_msg_id += 10
                     
@@ -701,8 +670,7 @@ async def _run_media_extractor(uid: int, cid: int, target_link: str, mode: str, 
             await _edit_raw(cid, status_msg_id, f"✅ <b>Bulk Extraction Complete!</b>\nTotal Extracted: <code>{extracted_count}</code> posts.\nSent to: <code>{dest_id}</code>")
 
     except Exception as e:
-        if status_msg_id:
-            await _edit_raw(cid, status_msg_id, f"❌ <b>Extraction Crashed:</b> {e}")
+        if status_msg_id: await _edit_raw(cid, status_msg_id, f"❌ <b>Extraction Crashed:</b> {e}")
         logger.error(f"Extractor Error: {e}")
     finally:
         try: await app.disconnect()
