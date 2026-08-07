@@ -19,7 +19,7 @@ from pyrogram.errors import (
     SessionPasswordNeeded, FloodWait, UsernameInvalid, 
     UsernameNotOccupied, ChannelPrivate, UserAlreadyParticipant,
     ChannelBanned, PeerIdInvalid, BadRequest, ChatAdminRequired,
-    InviteHashExpired, InviteHashInvalid 
+    InviteHashExpired, InviteHashInvalid, AuthKeyUnregistered 
 )
 from pyrogram.raw.functions.messages import CheckChatInvite
 from pyrogram.raw.types import ChatInviteAlready, ChatInvite
@@ -45,6 +45,18 @@ os.makedirs(SESSIONS_DIR, exist_ok=True)
 # VPS Logging
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────
+# GLOBAL PYROGRAM BOT INSTANCE (FIX FOR 401 ERROR)
+# ─────────────────────────────────────────
+PYRO_BOT = Client(
+    "main_bot_session",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN,
+    workdir=SESSIONS_DIR,
+    no_updates=True
+)
 
 # ─────────────────────────────────────────
 #  DYNAMIC CONFIGURATION SYSTEM
@@ -570,22 +582,21 @@ async def _run_media_extractor(uid: int, cid: int, target_link: str, mode: str, 
 
     app = Client(scraper_sessions[0], api_id=API_ID, api_hash=API_HASH, no_updates=True)
     
-    # ─────────────────────────────────────────
-    # FIX: Using persistent file session instead of in_memory=True
-    # This prevents the 401 AUTH_KEY_UNREGISTERED error completely
-    # ─────────────────────────────────────────
-    bot_session_path = os.path.join(SESSIONS_DIR, f"bot_uploader_{uid}")
-    bot_uploader = Client(bot_session_path, api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, no_updates=True)
-    
-    prog_resp = await _send_raw(cid, "🔄 <b>Connecting Scraper & Bot IDs to extract media...</b>")
+    prog_resp = await _send_raw(cid, "🔄 <b>Connecting Scraper ID to extract media...</b>")
     status_msg_id = prog_resp.get("result", {}).get("message_id") if isinstance(prog_resp, dict) else None
 
     try:
-        await app.connect()
-        await bot_uploader.connect()
+        try:
+            await app.connect()
+        except AuthKeyUnregistered:
+            await _edit_raw(cid, status_msg_id, "❌ <b>Scraper Session Expired!</b>\nYour Scraper ID was logged out or revoked by Telegram. Please delete it and login again.")
+            try: os.remove(scraper_sessions[0] + ".session")
+            except: pass
+            EXTRACTOR_TASKS[uid] = False
+            return
 
         try:
-            await bot_uploader.get_chat(dest_id)
+            await PYRO_BOT.get_chat(dest_id)
         except Exception as cache_err:
             logger.warning(f"Could not pre-fetch dest_id {dest_id} for bot caching: {cache_err}. Direct raw API will handle texts.")
 
@@ -613,7 +624,7 @@ async def _run_media_extractor(uid: int, cid: int, target_link: str, mode: str, 
                 await _edit_raw(cid, status_msg_id, f"❌ <b>Error fetching message:</b> {single_e}")
                 return
                 
-            success = await process_and_send_media(app, bot_uploader, msg, dest_id, cid, status_msg_id)
+            success = await process_and_send_media(app, PYRO_BOT, msg, dest_id, cid, status_msg_id)
             if success:
                 await _edit_raw(cid, status_msg_id, f"✅ <b>Successfully Extracted Single Post!</b>\nSent to Target ID: <code>{dest_id}</code>")
             else:
@@ -655,7 +666,7 @@ async def _run_media_extractor(uid: int, cid: int, target_link: str, mode: str, 
                     for msg in valid_msgs:
                         if msg.id >= current_msg_id:
                             if msg.text and msg.text.startswith("/start"): continue
-                            success = await process_and_send_media(app, bot_uploader, msg, dest_id, cid, None)
+                            success = await process_and_send_media(app, PYRO_BOT, msg, dest_id, cid, None)
                             if success:
                                 extracted_count += 1
                                 if extracted_count % 3 == 0:
@@ -676,8 +687,6 @@ async def _run_media_extractor(uid: int, cid: int, target_link: str, mode: str, 
         logger.error(f"Extractor Error: {e}")
     finally:
         try: await app.disconnect()
-        except: pass
-        try: await bot_uploader.disconnect()
         except: pass
         EXTRACTOR_TASKS[uid] = False
 
@@ -700,7 +709,15 @@ async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True):
     
     try:
         print(f"[{datetime.now()}] 🚀 Connecting Scraper for Deep Scrape...")
-        await app.connect()
+        try:
+            await app.connect()
+        except AuthKeyUnregistered:
+            if manual: await _send_raw(cid, "❌ <b>Scraper Session Expired!</b>\nYour ID was logged out by Telegram. Please delete it and login again.")
+            try: os.remove(scraper_path + ".session")
+            except: pass
+            SCRAPER_TASKS[uid] = "stopped"
+            return
+            
         total_extracted = 0
         if uid not in SCRAPER_DUPLICATES: SCRAPER_DUPLICATES[uid] = set()
 
@@ -921,14 +938,21 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False
     for idx, s_path in enumerate(sessions):
         try:
             app = Client(s_path, api_id=API_ID, api_hash=API_HASH, no_updates=True)
-            await app.connect()
+            try:
+                await app.connect()
+            except AuthKeyUnregistered:
+                print(f"[{datetime.now()}] ❌ Checker ID {s_path} is Unregistered/Expired. Removing it.")
+                try: os.remove(s_path + ".session")
+                except: pass
+                continue
+                
             slot = str(s_path.split('_')[-1] if '_' in s_path else idx + 1)
             clients_dict[slot] = {"app": app, "ready_at": 0, "name": f"ID {slot}", "checks": 0, "enabled": True}
         except Exception as e: 
             print(f"[{datetime.now()}] ❌ Failed to connect Checker ID {s_path}: {e}")
 
     if not clients_dict:
-        await _send_raw(cid, "❌ Failed to connect any of your logged-in IDs.")
+        await _send_raw(cid, "❌ Failed to connect any of your logged-in IDs. Please check Account Bank.")
         CHECKING_LOCKS[uid] = False
         return
 
@@ -1639,6 +1663,13 @@ async def start_background_tasks(application: Application):
     यह फंक्शन बॉट स्टार्ट होने के बाद ऑटो-स्क्रैपर को बैकग्राउंड में चलाएगा
     जिससे Terminal में कोई 'Task destroyed' का एरर नहीं आएगा।
     """
+    global PYRO_BOT
+    try:
+        await PYRO_BOT.start()
+        print(f"[{datetime.now()}] 🟢 Global Pyrogram Bot Uploader Started Successfully!")
+    except Exception as e:
+        print(f"[{datetime.now()}] ❌ Failed to start Global Pyrogram Bot: {e}")
+
     asyncio.create_task(auto_scraper_loop())
     print(f"[{datetime.now()}] 🟢 Background Auto-Scraper Task Started Successfully!")
 
