@@ -39,6 +39,7 @@ USERS_FILE = "users.txt"
 SCRAPER_STATE_FILE = "scraper_state.json"
 STORAGE_STATE_FILE = "storage_state.json"  
 CONFIG_FILE = "bot_config.json"
+SEEN_LINKS_FILE = "seen_links.txt" # New file for permanent memory
 
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 
@@ -47,7 +48,7 @@ logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=lo
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────
-# GLOBAL PYROGRAM BOT INSTANCE (FIX FOR 401 ERROR)
+# GLOBAL PYROGRAM BOT INSTANCE
 # ─────────────────────────────────────────
 PYRO_BOT = Client(
     "main_bot_session",
@@ -61,7 +62,6 @@ PYRO_BOT = Client(
 # ─────────────────────────────────────────
 #  DYNAMIC CONFIGURATION SYSTEM
 # ─────────────────────────────────────────
-# Default Channels (will be used if config file doesn't exist)
 DEFAULT_CONFIG = {
     "STORAGE_CHANNEL_ID": -1004448809511,
     "ACTIVE_CHANNEL_ID": -1004458234660,
@@ -119,7 +119,7 @@ def get_conf(key: str) -> int:
     return cfg.get(key, DEFAULT_CONFIG.get(key))
 
 # ─────────────────────────────────────────
-#  STATE & LOCKS & QUEUES
+#  STATE & LOCKS & QUEUES & MEMORY
 # ─────────────────────────────────────────
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 LOGIN_STATE = {} 
@@ -130,10 +130,28 @@ USER_DELAYS = {}
 
 SCRAPER_DUPLICATES = {}  
 CHECKER_DUPLICATES = {}  
+GLOBAL_SEEN_LINKS = set()
 
 CHECKER_STATE = {}
 SCRAPER_TASKS = {}
 EXTRACTOR_TASKS = {} 
+
+def load_seen_links():
+    if os.path.exists(SEEN_LINKS_FILE):
+        try:
+            with open(SEEN_LINKS_FILE, "r") as f:
+                for line in f:
+                    GLOBAL_SEEN_LINKS.add(line.strip())
+        except Exception as e:
+            logger.error(f"Error loading seen links: {e}")
+
+def add_seen_link(link: str):
+    if link not in GLOBAL_SEEN_LINKS:
+        GLOBAL_SEEN_LINKS.add(link)
+        try:
+            with open(SEEN_LINKS_FILE, "a") as f:
+                f.write(f"{link}\n")
+        except: pass
 
 # ─────────────────────────────────────────
 #  JSON STATE LOADERS
@@ -230,8 +248,9 @@ def extract_links(text: str) -> list:
         lnk = lnk.rstrip("-.,_ \n\t*`~")
         if not lnk.startswith("http"): lnk = "https://" + lnk
         if lnk not in seen and "t.me/" in lnk:
-            seen.add(lnk)
-            out.append(lnk)
+            if lnk not in GLOBAL_SEEN_LINKS:
+                seen.add(lnk)
+                out.append(lnk)
     return out
 
 def parse_link(link: str) -> tuple:
@@ -253,14 +272,14 @@ def parse_msg_link(link: str):
         elif "t.me/" in link:
             url_part = link.split("t.me/")[1]
             parts = url_part.split("/")
+            if parts[0] == "joinchat" or parts[0].startswith("+"):
+                return None, None
             chat_username = parts[0].split("?")[0]
-            
-            msg_id = 1
+            msg_id = 0
             if len(parts) > 1:
                 maybe_id = parts[1].split("?")[0]
                 if maybe_id.isdigit():
                     msg_id = int(maybe_id)
-                    
             return chat_username, msg_id
     except Exception:
         pass
@@ -314,32 +333,49 @@ async def try_check_link(app: Client, link: str):
                 try: chat = await app.get_chat(inv.chat.id)
                 except: chat = await app.get_chat(int(f"-100{inv.chat.id}"))
             elif isinstance(inv, ChatInvite):
-                try:
-                    chat = await app.join_chat(link)
-                    joined_now = True
-                    await asyncio.sleep(2) 
-                    try: chat = await app.get_chat(chat.id)
-                    except: pass
-                except UserAlreadyParticipant:
-                    chat = await app.get_chat(link)
-                except Exception as inner_e:
-                    err_msg = str(inner_e).lower()
-                    if "invite_request_sent" in err_msg:
-                        await asyncio.sleep(1)
-                        try:
-                            chat = await app.get_chat(link)
-                            joined_now = True
-                        except Exception:
-                            raise inner_e 
-                    else:
-                        raise inner_e
+                retry_count = 0
+                while retry_count <= 2:
+                    try:
+                        chat = await app.join_chat(link)
+                        joined_now = True
+                        await asyncio.sleep(2) 
+                        try: chat = await app.get_chat(chat.id)
+                        except: pass
+                        break
+                    except UserAlreadyParticipant:
+                        chat = await app.get_chat(link)
+                        break
+                    except Exception as inner_e:
+                        err_msg = str(inner_e).lower()
+                        if "invite_request_sent" in err_msg:
+                            await asyncio.sleep(1)
+                            try:
+                                chat = await app.get_chat(link)
+                                joined_now = True
+                            except Exception:
+                                raise inner_e 
+                            break
+                        else:
+                            retry_count += 1
+                            if retry_count == 1:
+                                await asyncio.sleep(2)
+                            elif retry_count == 2:
+                                await asyncio.sleep(random.uniform(2, 5))
+                            else:
+                                raise inner_e
 
         result["status"] = "active"
         
         if chat:
             raw_title = getattr(chat, 'title', None) or getattr(chat, 'first_name', "Unknown")
             result["title"] = clean_html_text(raw_title)
-            result["members"] = str(getattr(chat, 'members_count', 'N/A'))
+            
+            mem_count = getattr(chat, 'members_count', None)
+            if mem_count is None:
+                try:
+                    mem_count = await app.get_chat_members_count(chat.id)
+                except: pass
+            result["members"] = str(mem_count) if mem_count else 'N/A'
             
             has_protected = getattr(chat, 'has_protected_content', False)
             result["forward"] = "❌ Off" if has_protected else "✅ On"
@@ -745,8 +781,6 @@ async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True):
                         parts = chat_target.split("/c/")[1].split("/")
                         chat_id = int("-100" + parts[0])
                         chat = await app.get_chat(chat_id)
-                        if len(parts) > 1 and last_msg_id == 0:
-                            last_msg_id = int(parts[1]) - 1 
                     else:
                         username = chat_target.split("t.me/")[1].split("/")[0].split("?")[0]
                         chat = await app.get_chat(username)
@@ -772,9 +806,10 @@ async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True):
                     
                     if links:
                         for l in links:
-                            if l not in SCRAPER_DUPLICATES[uid]:
+                            if l not in GLOBAL_SEEN_LINKS and l not in SCRAPER_DUPLICATES[uid]:
                                 chunk_links.append(l)
                                 SCRAPER_DUPLICATES[uid].add(l)
+                                add_seen_link(l) 
                                 total_extracted += 1
                 
                 targets[target] = new_last_id
@@ -1007,9 +1042,10 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False
                             links = extract_links(msg.text or msg.caption or "")
                             
                             for l in links:
-                                if l not in CHECKER_DUPLICATES[uid]:
+                                if l not in GLOBAL_SEEN_LINKS and l not in CHECKER_DUPLICATES[uid]:
                                     USER_QUEUES[uid].append({"link": l, "message_id": msg.id, "chat_id": get_conf("STORAGE_CHANNEL_ID")})
                                     CHECKER_DUPLICATES[uid].add(l)
+                                    add_seen_link(l)
                                     links_found_in_batch = True
                                     if not fetched_msg: 
                                         fetched_msg = msg
@@ -1496,6 +1532,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif mode == "scraper_target":
         state = load_scraper_state(uid)
         target_val = None
+        msg_id_to_save = 0
         
         forward_origin = getattr(update.message, 'forward_origin', None)
         
@@ -1508,16 +1545,20 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             target_val = str(update.message.forward_from_chat.id)
         else:
             text_val = text.strip()
-            if "t.me/" in text_val or text_val.startswith("-100") or text_val.startswith("@") or text_val.isdigit():
+            chat_val, m_id = parse_msg_link(text_val)
+            if chat_val:
+                target_val = str(chat_val)
+                msg_id_to_save = m_id if m_id else 0
+            elif "t.me/" in text_val or text_val.startswith("-100") or text_val.startswith("@") or text_val.isdigit():
                 target_val = text_val
             
         if target_val:
             targets = state.get("targets", {})
             if target_val not in targets:
-                targets[target_val] = 0
+                targets[target_val] = msg_id_to_save
                 state["targets"] = targets
                 save_scraper_state(uid, state)
-                await update.message.reply_text(f"✅ <b>Target Successfully Added:</b> <code>{target_val}</code>\n\n<i>Note: Your Scraper ID will automatically detect if it's already a member and start scraping new links from this chat!</i>", parse_mode="HTML")
+                await update.message.reply_text(f"✅ <b>Target Successfully Added:</b> <code>{target_val}</code>\n<i>Bot will start scraping from message ID {msg_id_to_save} onwards.</i>", parse_mode="HTML")
             else:
                 await update.message.reply_text("⚠️ Target is already added.")
             ctx.user_data["mode"] = ""
@@ -1629,9 +1670,10 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         added_count = duplicate_count = 0
 
         for l in links:
-            if l not in CHECKER_DUPLICATES[uid]:
+            if l not in GLOBAL_SEEN_LINKS and l not in CHECKER_DUPLICATES[uid]:
                 USER_QUEUES[uid].append({"link": l, "message_id": bunch_msg_id, "chat_id": cid})
                 CHECKER_DUPLICATES[uid].add(l)
+                add_seen_link(l)
                 added_count += 1
             else: duplicate_count += 1
 
@@ -1659,10 +1701,6 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 #  POST-INIT HOOK FOR BACKGROUND TASKS
 # ─────────────────────────────────────────
 async def start_background_tasks(application: Application):
-    """
-    यह फंक्शन बॉट स्टार्ट होने के बाद ऑटो-स्क्रैपर को बैकग्राउंड में चलाएगा
-    जिससे Terminal में कोई 'Task destroyed' का एरर नहीं आएगा।
-    """
     global PYRO_BOT
     try:
         await PYRO_BOT.start()
@@ -1670,6 +1708,7 @@ async def start_background_tasks(application: Application):
     except Exception as e:
         print(f"[{datetime.now()}] ❌ Failed to start Global Pyrogram Bot: {e}")
 
+    load_seen_links()
     asyncio.create_task(auto_scraper_loop())
     print(f"[{datetime.now()}] 🟢 Background Auto-Scraper Task Started Successfully!")
 
@@ -1682,7 +1721,6 @@ def main():
     
     print(f"[{datetime.now()}] 🟢 Bot is running with Multi-Scraper & Smart Memory System...")
     
-    # run_polling अपना खुद का Event Loop बनाता है और साफ़-सुथरे तरीके से क्लोज करता है
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
