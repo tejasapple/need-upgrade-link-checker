@@ -87,7 +87,6 @@ def load_bot_config():
         try:
             with open(CONFIG_FILE, "r") as f:
                 loaded = json.load(f)
-                # Merge with default to ensure missing keys are present
                 for k, v in DEFAULT_CONFIG.items():
                     if k not in loaded:
                         loaded[k] = v
@@ -404,7 +403,7 @@ async def try_check_link(app: Client, link: str):
             return result, True, 0
 
 # ─────────────────────────────────────────
-#  INSTANT SENDER & ROUTING (Dynamic IDs)
+#  INSTANT SENDER & ROUTING
 # ─────────────────────────────────────────
 async def _send_raw(chat_id: int, text: str, keyboard=None, retries=3):
     if not chat_id or chat_id == 0: return False
@@ -486,12 +485,11 @@ async def dispatch_result(r: dict, stats_tracker: dict):
         await _send_raw(get_conf("SKIPPED_CHANNEL_ID"), f"<b>⚠️ SKIPPED LINK</b>\n━━━━━━━━━━\n{msg}")
 
 # ─────────────────────────────────────────
-#  MEDIA EXTRACTOR (ULTIMATE is_premium BUG SHIELD)
+#  MEDIA EXTRACTOR
 # ─────────────────────────────────────────
 async def process_and_send_media(app, bot_uploader, msg, dest_id, cid, status_msg_id=None):
     if not msg or msg.empty: return False
     
-    # Get Text / Caption
     caption = msg.caption or ""
     if not caption and msg.text:
         caption = msg.text
@@ -504,24 +502,20 @@ async def process_and_send_media(app, bot_uploader, msg, dest_id, cid, status_ms
         
     media_obj = get_media_property(msg)
             
-    # 1. Safety Check for Only-Text Messages (Upload via Bot)
     if not media_obj:
         if caption:
             try: 
-                # Try via Pyrogram Client first
                 await bot_uploader.send_message(dest_id, text=caption)
                 return True
             except PeerIdInvalid:
-                # 🛡️ THE FIX: Fallback to direct raw API request if Pyrogram memory fails
                 logger.warning("PeerIdInvalid caught for text. Falling back to direct raw API...")
-                safe_caption = html.escape(caption) # Make it safe for HTML Parse Mode
+                safe_caption = html.escape(caption)
                 await _send_raw(dest_id, safe_caption)
                 return True
             except Exception as e: 
                 logger.error(f"Bot failed to send text: {e}")
         return False
         
-    # 2. Download Media (Using Scraper ID / app)
     if status_msg_id: 
         await _edit_raw(cid, status_msg_id, "📥 <b>Downloading media to VPS...</b>\n<i>Please wait...</i>")
     
@@ -535,7 +529,6 @@ async def process_and_send_media(app, bot_uploader, msg, dest_id, cid, status_ms
     if not file_path or not os.path.exists(file_path):
         return False
         
-    # 3. STRICT UPLOAD (With is_premium bug bypass)
     if status_msg_id: 
         await _edit_raw(cid, status_msg_id, "📤 <b>Uploading media to destination via Bot...</b>")
     
@@ -552,14 +545,12 @@ async def process_and_send_media(app, bot_uploader, msg, dest_id, cid, status_ms
     except Exception as e:
         err_str = str(e).lower()
         if "is_premium" in err_str or "nonetype" in err_str:
-            # THIS IS THE SHIELD: Pyrogram crashes on response parse, but file actually uploads!
             logger.warning(f"Ignored Telegram 'is_premium' bug. File uploaded successfully.")
             success = True
         else:
             logger.error(f"Bot upload failed: {e}")
             success = False
         
-    # 4. Cleanup Memory
     if os.path.exists(file_path):
         try: os.remove(file_path)
         except: pass
@@ -577,9 +568,8 @@ async def _run_media_extractor(uid: int, cid: int, target_link: str, mode: str, 
         await _send_raw(cid, "❌ <b>Invalid Post Link!</b>\nPlease provide a direct link to a message or bot (e.g., t.me/c/12345/67 or Bot Link)")
         return
 
-    loop = asyncio.get_event_loop()
-    app = Client(scraper_sessions[0], api_id=API_ID, api_hash=API_HASH, no_updates=True, loop=loop)
-    bot_uploader = Client("bot_uploader_temp", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True, no_updates=True, loop=loop)
+    app = Client(scraper_sessions[0], api_id=API_ID, api_hash=API_HASH, no_updates=True)
+    bot_uploader = Client("bot_uploader_temp", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True, no_updates=True)
     
     prog_resp = await _send_raw(cid, "🔄 <b>Connecting Scraper & Bot IDs to extract media...</b>")
     status_msg_id = prog_resp.get("result", {}).get("message_id") if isinstance(prog_resp, dict) else None
@@ -588,7 +578,6 @@ async def _run_media_extractor(uid: int, cid: int, target_link: str, mode: str, 
         await app.connect()
         await bot_uploader.connect()
 
-        # 🛡️ FIX: Pre-fetch chat to cache the Peer ID for the bot_uploader memory session
         try:
             await bot_uploader.get_chat(dest_id)
         except Exception as cache_err:
@@ -605,7 +594,6 @@ async def _run_media_extractor(uid: int, cid: int, target_link: str, mode: str, 
                 payload = target_link.split("?start=")[1].split("&")[0]
                 sent_msg = await app.send_message(chat.id, f"/start {payload}")
                 await _edit_raw(cid, status_msg_id, f"🤖 <b>Bot Deep Link Detected!</b>\nSent <code>/start {payload}</code> to {chat.first_name or chat.username}.\n<i>Waiting for bot to load media...</i>")
-                # INCREASED WAIT TIME: Bots take time to reply with media
                 await asyncio.sleep(8) 
                 start_msg_id = sent_msg.id
                 mode = "bulk" 
@@ -640,7 +628,6 @@ async def _run_media_extractor(uid: int, cid: int, target_link: str, mode: str, 
                         msgs = await app.get_messages(chat.id, list(range(current_msg_id, current_msg_id + chunk_size)))
                     except Exception as chunk_e:
                         err_str = str(chunk_e).lower()
-                        # SHIELD: If bulk chunk crashes because of is_premium bug, do it 1-by-1
                         if "is_premium" in err_str or "nonetype" in err_str:
                             for single_id in range(current_msg_id, current_msg_id + chunk_size):
                                 try:
@@ -654,7 +641,6 @@ async def _run_media_extractor(uid: int, cid: int, target_link: str, mode: str, 
                     
                     if not valid_msgs:
                         empty_patches += 1
-                        # INCREASED TOLERANCE: Will not stop at 0 if bot took time to reply
                         if empty_patches > 20: 
                             break
                     else:
@@ -668,7 +654,6 @@ async def _run_media_extractor(uid: int, cid: int, target_link: str, mode: str, 
                                 extracted_count += 1
                                 if extracted_count % 3 == 0:
                                     await _edit_raw(cid, status_msg_id, f"🔄 <b>Bulk Extraction in Progress...</b>\nExtracted: <code>{extracted_count}</code> posts so far.")
-                            # ANTI-BAN DELAY: To prevent Scraper ID from being blocked
                             await asyncio.sleep(2.5) 
                     
                     current_msg_id += chunk_size
@@ -705,8 +690,7 @@ async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True):
         return
 
     scraper_path = scraper_sessions[0]
-    loop = asyncio.get_event_loop()
-    app = Client(scraper_path, api_id=API_ID, api_hash=API_HASH, no_updates=True, loop=loop)
+    app = Client(scraper_path, api_id=API_ID, api_hash=API_HASH, no_updates=True)
     
     try:
         print(f"[{datetime.now()}] 🚀 Connecting Scraper for Deep Scrape...")
@@ -928,10 +912,9 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False
     print(f"[{datetime.now()}] 🔄 Initializing Bulk Check Queue for UID: {uid}")
     
     clients_dict = {}
-    loop = asyncio.get_event_loop()
     for idx, s_path in enumerate(sessions):
         try:
-            app = Client(s_path, api_id=API_ID, api_hash=API_HASH, no_updates=True, loop=loop)
+            app = Client(s_path, api_id=API_ID, api_hash=API_HASH, no_updates=True)
             await app.connect()
             slot = str(s_path.split('_')[-1] if '_' in s_path else idx + 1)
             clients_dict[slot] = {"app": app, "ready_at": 0, "name": f"ID {slot}", "checks": 0, "enabled": True}
@@ -1136,7 +1119,7 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False
     print(f"[{datetime.now()}] ✅ Bulk Check Queue Completed/Stopped for UID: {uid}")
 
 # ─────────────────────────────────────────
-#  UI & UTILS (Separated Menus)
+#  UI & UTILS
 # ─────────────────────────────────────────
 async def _edit_raw(chat_id, message_id, text, keyboard=None):
     payload = {"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
@@ -1218,20 +1201,16 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data["mode"] = "ext_bulk_wait"
         await _edit_raw(cid, mid, "📚 <b>Bulk Post Extraction</b>\n\nSend the STARTING message link.\nBot will extract that message and ALL messages posted after it sequentially.\n\n<i>Make sure your Scraper ID has joined!</i>", [[{"text": "🔙 Cancel", "callback_data": "menu_extractor_main"}]])
 
-    # --- DYNAMIC CONFIGURATIONS MENUS ---
     elif d == "menu_config_checker":
         kb = []
         cfg = load_bot_config()
-        # Filter only checker related configs
         checker_keys = [k for k in CONFIG_NAMES.keys() if k != "EXTRACTOR_UPLOAD_ID"]
         for k in checker_keys:
             val_str = str(cfg.get(k, DEFAULT_CONFIG[k]))
-            # Make shorter for display
             if len(val_str) > 10: val_str = val_str[:4] + ".." + val_str[-4:]
             name = CONFIG_NAMES[k]
             kb.append([{"text": f"{name}: {val_str}", "callback_data": f"setcfg_{k}"}])
         kb.append([{"text": "🔙 Back", "callback_data": "menu_pro"}])
-        
         await _edit_raw(cid, mid, "⚙️ <b>Channel Configurations (Checker)</b>\n\nClick any button below to change its Channel ID.", kb)
 
     elif d == "menu_config_extractor":
@@ -1372,10 +1351,9 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _edit_raw(cid, mid, "⏳ <b>Checking health of all logged-in Checker IDs...</b>\n\n<i>This might take a moment.</i>")
         sessions = get_user_sessions(uid, "checker")
         working_count = dead_count = 0
-        loop = asyncio.get_event_loop()
         for s in sessions:
             try:
-                app = Client(s, api_id=API_ID, api_hash=API_HASH, no_updates=True, loop=loop)
+                app = Client(s, api_id=API_ID, api_hash=API_HASH, no_updates=True)
                 await app.connect()
                 if await app.get_me(): working_count += 1
                 await app.disconnect()
@@ -1426,7 +1404,6 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Action cancelled. Use /start again.")
         return 
 
-    # --- DYNAMIC CONFIG HANDLER ---
     if mode.startswith("waiting_cfg_"):
         cfg_key = mode.replace("waiting_cfg_", "")
         try:
@@ -1438,7 +1415,6 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ctx.user_data["mode"] = ""
             cfg_name = CONFIG_NAMES.get(cfg_key, cfg_key)
             
-            # Send success and return button depending on where they came from
             if cfg_key == "EXTRACTOR_UPLOAD_ID":
                 kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Config", callback_data="menu_config_extractor")]])
             else:
@@ -1449,7 +1425,6 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Invalid ID format. Please send a valid numeric Channel/Group ID (e.g. -1001234567).")
         return
 
-    # --- EXTRACTOR HANDLER ---
     if mode in ["ext_single_wait", "ext_bulk_wait"]:
         if EXTRACTOR_TASKS.get(uid):
             await update.message.reply_text("⚠️ Extraction already running. Please wait.")
@@ -1463,12 +1438,10 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ext_mode = "single" if mode == "ext_single_wait" else "bulk"
         ctx.user_data["mode"] = "" 
         
-        # Use dynamic upload ID
         target_upload_id = get_conf("EXTRACTOR_UPLOAD_ID")
         asyncio.create_task(_run_media_extractor(uid, cid, text, ext_mode, target_upload_id))
         return
 
-    # --- OTHER HANDLERS ---
     if mode == "guest_check":
         links = extract_links(text)
         if not links:
@@ -1548,7 +1521,6 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 
             print(f"[{datetime.now()}] 📱 Attempting to send OTP to {text}")
             
-            loop = asyncio.get_event_loop()
             app = Client(
                 os.path.join(SESSIONS_DIR, s_name), 
                 api_id=API_ID, 
@@ -1556,8 +1528,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 device_model="Windows 11 PC",
                 system_version="Windows 11",
                 app_version="4.14.9",
-                lang_code="en",
-                loop=loop
+                lang_code="en"
             )
             
             await app.connect()
@@ -1654,22 +1625,28 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         CHECKING_LOCKS[uid] = True
         asyncio.create_task(_run_bulk_check(uid, cid, sessions, auto_storage=False))
 
+# ─────────────────────────────────────────
+#  POST-INIT HOOK FOR BACKGROUND TASKS
+# ─────────────────────────────────────────
+async def start_background_tasks(application: Application):
+    """
+    यह फंक्शन बॉट स्टार्ट होने के बाद ऑटो-स्क्रैपर को बैकग्राउंड में चलाएगा
+    जिससे Terminal में कोई 'Task destroyed' का एरर नहीं आएगा।
+    """
+    asyncio.create_task(auto_scraper_loop())
+    print(f"[{datetime.now()}] 🟢 Background Auto-Scraper Task Started Successfully!")
+
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(start_background_tasks).build()
+    
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     
     print(f"[{datetime.now()}] 🟢 Bot is running with Multi-Scraper & Smart Memory System...")
     
-    loop = asyncio.get_event_loop()
-    scraper_task = loop.create_task(auto_scraper_loop())
-    
-    try:
-        app.run_polling(drop_pending_updates=True)
-    finally:
-        if not scraper_task.done():
-            scraper_task.cancel() # Fixes the "Task was destroyed" warning in terminal
+    # run_polling अपना खुद का Event Loop बनाता है और साफ़-सुथरे तरीके से क्लोज करता है
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
