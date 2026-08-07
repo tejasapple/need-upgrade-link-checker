@@ -508,7 +508,14 @@ async def process_and_send_media(app, bot_uploader, msg, dest_id, cid, status_ms
     if not media_obj:
         if caption:
             try: 
+                # Try via Pyrogram Client first
                 await bot_uploader.send_message(dest_id, text=caption)
+                return True
+            except PeerIdInvalid:
+                # 🛡️ THE FIX: Fallback to direct raw API request if Pyrogram memory fails
+                logger.warning("PeerIdInvalid caught for text. Falling back to direct raw API...")
+                safe_caption = html.escape(caption) # Make it safe for HTML Parse Mode
+                await _send_raw(dest_id, safe_caption)
                 return True
             except Exception as e: 
                 logger.error(f"Bot failed to send text: {e}")
@@ -579,6 +586,13 @@ async def _run_media_extractor(uid: int, cid: int, target_link: str, mode: str, 
     try:
         await app.connect()
         await bot_uploader.connect()
+
+        # 🛡️ FIX: Pre-fetch chat to cache the Peer ID for the bot_uploader memory session
+        try:
+            await bot_uploader.get_chat(dest_id)
+        except Exception as cache_err:
+            logger.warning(f"Could not pre-fetch dest_id {dest_id} for bot caching: {cache_err}. Direct raw API will handle texts.")
+
         try:
             chat = await app.get_chat(chat_id)
         except Exception as e:
@@ -822,6 +836,8 @@ async def auto_scraper_loop():
                                 print(f"[{datetime.now()}] 🔄 Starting Auto-Scrape for UID: {uid}")
                                 SCRAPER_TASKS[uid] = "running"
                                 asyncio.create_task(_run_daily_scraper_task(uid, uid, state, manual=False))
+        except asyncio.CancelledError:
+            break
         except Exception as e:
             logger.error(f"Auto Scraper Loop Error: {e}")
             
@@ -1641,9 +1657,13 @@ def main():
     print(f"[{datetime.now()}] 🟢 Bot is running with Multi-Scraper & Smart Memory System...")
     
     loop = asyncio.get_event_loop()
-    loop.create_task(auto_scraper_loop())
+    scraper_task = loop.create_task(auto_scraper_loop())
     
-    app.run_polling(drop_pending_updates=True)
+    try:
+        app.run_polling(drop_pending_updates=True)
+    finally:
+        if not scraper_task.done():
+            scraper_task.cancel() # Fixes the "Task was destroyed" warning in terminal
 
 if __name__ == "__main__":
     main()
