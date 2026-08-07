@@ -577,8 +577,9 @@ async def _run_media_extractor(uid: int, cid: int, target_link: str, mode: str, 
         await _send_raw(cid, "❌ <b>Invalid Post Link!</b>\nPlease provide a direct link to a message or bot (e.g., t.me/c/12345/67 or Bot Link)")
         return
 
-    app = Client(scraper_sessions[0], api_id=API_ID, api_hash=API_HASH, no_updates=True)
-    bot_uploader = Client("bot_uploader_temp", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True, no_updates=True)
+    loop = asyncio.get_event_loop()
+    app = Client(scraper_sessions[0], api_id=API_ID, api_hash=API_HASH, no_updates=True, loop=loop)
+    bot_uploader = Client("bot_uploader_temp", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True, no_updates=True, loop=loop)
     
     prog_resp = await _send_raw(cid, "🔄 <b>Connecting Scraper & Bot IDs to extract media...</b>")
     status_msg_id = prog_resp.get("result", {}).get("message_id") if isinstance(prog_resp, dict) else None
@@ -704,7 +705,8 @@ async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True):
         return
 
     scraper_path = scraper_sessions[0]
-    app = Client(scraper_path, api_id=API_ID, api_hash=API_HASH, no_updates=True)
+    loop = asyncio.get_event_loop()
+    app = Client(scraper_path, api_id=API_ID, api_hash=API_HASH, no_updates=True, loop=loop)
     
     try:
         print(f"[{datetime.now()}] 🚀 Connecting Scraper for Deep Scrape...")
@@ -926,9 +928,10 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False
     print(f"[{datetime.now()}] 🔄 Initializing Bulk Check Queue for UID: {uid}")
     
     clients_dict = {}
+    loop = asyncio.get_event_loop()
     for idx, s_path in enumerate(sessions):
         try:
-            app = Client(s_path, api_id=API_ID, api_hash=API_HASH, no_updates=True)
+            app = Client(s_path, api_id=API_ID, api_hash=API_HASH, no_updates=True, loop=loop)
             await app.connect()
             slot = str(s_path.split('_')[-1] if '_' in s_path else idx + 1)
             clients_dict[slot] = {"app": app, "ready_at": 0, "name": f"ID {slot}", "checks": 0, "enabled": True}
@@ -1369,9 +1372,10 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _edit_raw(cid, mid, "⏳ <b>Checking health of all logged-in Checker IDs...</b>\n\n<i>This might take a moment.</i>")
         sessions = get_user_sessions(uid, "checker")
         working_count = dead_count = 0
+        loop = asyncio.get_event_loop()
         for s in sessions:
             try:
-                app = Client(s, api_id=API_ID, api_hash=API_HASH, no_updates=True)
+                app = Client(s, api_id=API_ID, api_hash=API_HASH, no_updates=True, loop=loop)
                 await app.connect()
                 if await app.get_me(): working_count += 1
                 await app.disconnect()
@@ -1544,6 +1548,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 
             print(f"[{datetime.now()}] 📱 Attempting to send OTP to {text}")
             
+            loop = asyncio.get_event_loop()
             app = Client(
                 os.path.join(SESSIONS_DIR, s_name), 
                 api_id=API_ID, 
@@ -1551,7 +1556,8 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 device_model="Windows 11 PC",
                 system_version="Windows 11",
                 app_version="4.14.9",
-                lang_code="en"
+                lang_code="en",
+                loop=loop
             )
             
             await app.connect()
