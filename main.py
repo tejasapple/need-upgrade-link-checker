@@ -39,7 +39,6 @@ USERS_FILE = "users.txt"
 SCRAPER_STATE_FILE = "scraper_state.json"
 STORAGE_STATE_FILE = "storage_state.json"  
 CONFIG_FILE = "bot_config.json"
-SEEN_LINKS_FILE = "seen_links.txt" # New file for permanent memory
 
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 
@@ -130,28 +129,10 @@ USER_DELAYS = {}
 
 SCRAPER_DUPLICATES = {}  
 CHECKER_DUPLICATES = {}  
-GLOBAL_SEEN_LINKS = set()
 
 CHECKER_STATE = {}
 SCRAPER_TASKS = {}
 EXTRACTOR_TASKS = {} 
-
-def load_seen_links():
-    if os.path.exists(SEEN_LINKS_FILE):
-        try:
-            with open(SEEN_LINKS_FILE, "r") as f:
-                for line in f:
-                    GLOBAL_SEEN_LINKS.add(line.strip())
-        except Exception as e:
-            logger.error(f"Error loading seen links: {e}")
-
-def add_seen_link(link: str):
-    if link not in GLOBAL_SEEN_LINKS:
-        GLOBAL_SEEN_LINKS.add(link)
-        try:
-            with open(SEEN_LINKS_FILE, "a") as f:
-                f.write(f"{link}\n")
-        except: pass
 
 # ─────────────────────────────────────────
 #  JSON STATE LOADERS
@@ -247,10 +228,10 @@ def extract_links(text: str) -> list:
     for lnk in raw:
         lnk = lnk.rstrip("-.,_ \n\t*`~")
         if not lnk.startswith("http"): lnk = "https://" + lnk
+        # Removed GLOBAL_SEEN_LINKS check to allow full re-scraping
         if lnk not in seen and "t.me/" in lnk:
-            if lnk not in GLOBAL_SEEN_LINKS:
-                seen.add(lnk)
-                out.append(lnk)
+            seen.add(lnk)
+            out.append(lnk)
     return out
 
 def parse_link(link: str) -> tuple:
@@ -314,7 +295,7 @@ async def try_check_link(app: Client, link: str):
     is_private, ref = parse_link(link)
     result = {
         "link": link, "status": "skipped", "title": "Unknown", "username": "N/A",
-        "members": "N/A", "videos": "N/A", "photos": "N/A", "forward": "N/A", 
+        "members": "N/A", "videos": "N/A", "photos": "N/A", "forward": "✅ On", 
         "chatting": "❌ Off", "add_member": "❌ Off", "media_only": False
     }
     
@@ -328,10 +309,24 @@ async def try_check_link(app: Client, link: str):
             if getattr(chat, 'type', None) not in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP, enums.ChatType.CHANNEL]:
                 raise UsernameInvalid("Not a group or channel")
         else:
+            # Fixing the Unknown & N/A issue by grabbing Raw Data before joining
             inv = await app.invoke(CheckChatInvite(hash=ref))
+            
+            if hasattr(inv, 'title'): 
+                result["title"] = clean_html_text(inv.title)
+            elif hasattr(inv, 'chat') and hasattr(inv.chat, 'title'):
+                result["title"] = clean_html_text(inv.chat.title)
+                
+            if hasattr(inv, 'participants_count'): 
+                result["members"] = str(inv.participants_count)
+            elif hasattr(inv, 'chat') and hasattr(inv.chat, 'participants_count'):
+                result["members"] = str(inv.chat.participants_count)
+
             if isinstance(inv, ChatInviteAlready):
                 try: chat = await app.get_chat(inv.chat.id)
-                except: chat = await app.get_chat(int(f"-100{inv.chat.id}"))
+                except: 
+                    try: chat = await app.get_chat(int(f"-100{inv.chat.id}"))
+                    except: pass
             elif isinstance(inv, ChatInvite):
                 retry_count = 0
                 while retry_count <= 2:
@@ -343,17 +338,19 @@ async def try_check_link(app: Client, link: str):
                         except: pass
                         break
                     except UserAlreadyParticipant:
-                        chat = await app.get_chat(link)
+                        try: chat = await app.get_chat(link)
+                        except: pass
                         break
                     except Exception as inner_e:
                         err_msg = str(inner_e).lower()
                         if "invite_request_sent" in err_msg:
+                            result["title"] = result["title"] if result["title"] != "Unknown" else "Admin Approval Required"
                             await asyncio.sleep(1)
                             try:
                                 chat = await app.get_chat(link)
                                 joined_now = True
                             except Exception:
-                                raise inner_e 
+                                pass # We already got title and members from raw inv!
                             break
                         else:
                             retry_count += 1
@@ -367,15 +364,15 @@ async def try_check_link(app: Client, link: str):
         result["status"] = "active"
         
         if chat:
-            raw_title = getattr(chat, 'title', None) or getattr(chat, 'first_name', "Unknown")
-            result["title"] = clean_html_text(raw_title)
+            raw_title = getattr(chat, 'title', None) or getattr(chat, 'first_name', None)
+            if raw_title:
+                result["title"] = clean_html_text(raw_title)
             
             mem_count = getattr(chat, 'members_count', None)
             if mem_count is None:
-                try:
-                    mem_count = await app.get_chat_members_count(chat.id)
+                try: mem_count = await app.get_chat_members_count(chat.id)
                 except: pass
-            result["members"] = str(mem_count) if mem_count else 'N/A'
+            if mem_count: result["members"] = str(mem_count)
             
             has_protected = getattr(chat, 'has_protected_content', False)
             result["forward"] = "❌ Off" if has_protected else "✅ On"
@@ -443,7 +440,7 @@ async def try_check_link(app: Client, link: str):
             return result, False, 0
         elif "invite_request_sent" in err_msg:
             result["status"] = "active"
-            result["title"] = "Admin Approval Required"
+            result["title"] = result["title"] if result["title"] != "Unknown" else "Admin Approval Required"
             return result, False, 0
         else:
             result["status"] = "skipped"
@@ -755,10 +752,12 @@ async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True):
             return
             
         total_extracted = 0
+        # Cleared memory dynamically to allow scraping of ALL links requested by user
         if uid not in SCRAPER_DUPLICATES: SCRAPER_DUPLICATES[uid] = set()
+        SCRAPER_DUPLICATES[uid].clear() 
 
         if manual:
-            prog_resp = await _send_raw(cid, f"🔄 <b>Starting Deep Scrape from {len(targets)} Targets...</b>\n<i>(Extracting only links, tracking progress)</i>")
+            prog_resp = await _send_raw(cid, f"🔄 <b>Starting Deep Scrape from {len(targets)} Targets...</b>\n<i>(Extracting links, tracking progress)</i>")
             prog_msg_id = prog_resp.get("result", {}).get("message_id") if isinstance(prog_resp, dict) else None
         
         for target, last_msg_id in targets.items():
@@ -806,10 +805,9 @@ async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True):
                     
                     if links:
                         for l in links:
-                            if l not in GLOBAL_SEEN_LINKS and l not in SCRAPER_DUPLICATES[uid]:
+                            if l not in SCRAPER_DUPLICATES[uid]:
                                 chunk_links.append(l)
                                 SCRAPER_DUPLICATES[uid].add(l)
-                                add_seen_link(l) 
                                 total_extracted += 1
                 
                 targets[target] = new_last_id
@@ -837,7 +835,7 @@ async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True):
         save_scraper_state(uid, state)
 
         print(f"[{datetime.now()}] ✅ Scraping completed! Total: {total_extracted}")
-        msg_done = f"✅ <b>Scraping Complete!</b>\nExtracted <code>{total_extracted}</code> fresh links.\n\n"
+        msg_done = f"✅ <b>Scraping Complete!</b>\nExtracted <code>{total_extracted}</code> links.\n\n"
         
         checker_sessions = get_user_sessions(uid, "checker")
         if checker_sessions and total_extracted > 0:
@@ -1042,10 +1040,9 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False
                             links = extract_links(msg.text or msg.caption or "")
                             
                             for l in links:
-                                if l not in GLOBAL_SEEN_LINKS and l not in CHECKER_DUPLICATES[uid]:
+                                if l not in CHECKER_DUPLICATES[uid]:
                                     USER_QUEUES[uid].append({"link": l, "message_id": msg.id, "chat_id": get_conf("STORAGE_CHANNEL_ID")})
                                     CHECKER_DUPLICATES[uid].add(l)
-                                    add_seen_link(l)
                                     links_found_in_batch = True
                                     if not fetched_msg: 
                                         fetched_msg = msg
@@ -1346,7 +1343,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text = (f"🕷️ <b>Scraper Accounts & Target Manager</b>\n\n"
                 f"👤 <b>Active Scrapers:</b> {len(scraper_sessions)}\n"
                 f"🎯 <b>Active Targets ({len(targets)}):</b>\n{t_list}\n\n"
-                f"<i>(When adding a new target, Bot will extract all links. On next run, it will only extract NEW links.)</i>")
+                f"<i>(Note: When adding a new target, the Bot will extract all links and process them again even if seen before, as per your request.)</i>")
         await _edit_raw(cid, mid, text, kb)
 
     elif d == "scraper_tog_auto":
@@ -1370,7 +1367,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     elif d == "scraper_add_target":
         ctx.user_data["mode"] = "scraper_target"
-        await _edit_raw(cid, mid, "🎯 <b>Add New Scraper Target</b>\n\nYou can:\n1. Forward any message from the Group/Channel here.\n2. Send the Chat ID (e.g. `-10012345678`)\n3. Paste a Message Link (e.g. `t.me/c/12345/67` or `t.me/joinchat/...`)", [[{"text": "🔙 Cancel", "callback_data": "menu_scraper"}]])
+        await _edit_raw(cid, mid, "🎯 <b>Add New Scraper Target</b>\n\nYou can:\n1. Forward any message from the Group/Channel here.\n2. Send the Chat ID (e.g. `-10012345678`)\n3. Paste a Message Link (e.g. `t.me/c/12345/67` or `t.me/joinchat/...`)\n\n<i>(अगर आप पहले से एडेड टारगेट को दोबारा भेजते हैं, तो वह टारगेट रिसेट हो जाएगा और शुरू से सारे लिंक दोबारा स्क्रैप करेगा)</i>", [[{"text": "🔙 Cancel", "callback_data": "menu_scraper"}]])
 
     elif d == "scraper_rem_target":
         state = load_scraper_state(uid)
@@ -1401,7 +1398,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         state = load_scraper_state(uid)
         SCRAPER_TASKS[uid] = "running"
         asyncio.create_task(_run_daily_scraper_task(uid, cid, state, manual=True))
-        await _edit_raw(cid, mid, "✅ Initiating Smart Scrape...\nOnly fetching links & tracking history.", [[{"text": "🔙 Menu Pro", "callback_data": "menu_pro"}]])
+        await _edit_raw(cid, mid, "✅ Initiating Smart Scrape...\nExtracting all target links.", [[{"text": "🔙 Menu Pro", "callback_data": "menu_pro"}]])
 
     elif d == "menu_accounts":
         sessions = get_user_sessions(uid, "checker")
@@ -1554,13 +1551,11 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             
         if target_val:
             targets = state.get("targets", {})
-            if target_val not in targets:
-                targets[target_val] = msg_id_to_save
-                state["targets"] = targets
-                save_scraper_state(uid, state)
-                await update.message.reply_text(f"✅ <b>Target Successfully Added:</b> <code>{target_val}</code>\n<i>Bot will start scraping from message ID {msg_id_to_save} onwards.</i>", parse_mode="HTML")
-            else:
-                await update.message.reply_text("⚠️ Target is already added.")
+            # Overwriting the target if exists resets progress and forces rescrape!
+            targets[target_val] = msg_id_to_save
+            state["targets"] = targets
+            save_scraper_state(uid, state)
+            await update.message.reply_text(f"✅ <b>Target Successfully Added/Updated:</b> <code>{target_val}</code>\n<i>Bot will start scraping from message ID {msg_id_to_save} onwards. It will extract and process ALL links found as per settings.</i>", parse_mode="HTML")
             ctx.user_data["mode"] = ""
         else:
             await update.message.reply_text("❌ <b>Invalid input.</b>\nPlease send a valid Chat ID, Username, or Message Link.")
@@ -1670,10 +1665,9 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         added_count = duplicate_count = 0
 
         for l in links:
-            if l not in GLOBAL_SEEN_LINKS and l not in CHECKER_DUPLICATES[uid]:
+            if l not in CHECKER_DUPLICATES[uid]:
                 USER_QUEUES[uid].append({"link": l, "message_id": bunch_msg_id, "chat_id": cid})
                 CHECKER_DUPLICATES[uid].add(l)
-                add_seen_link(l)
                 added_count += 1
             else: duplicate_count += 1
 
@@ -1686,7 +1680,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         if CHECKING_LOCKS.get(uid):
             msg_text = f"✅ Added {added_count} new links to Queue."
-            if duplicate_count > 0: msg_text += f"\n🗑 Skipped {duplicate_count} duplicate links."
+            if duplicate_count > 0: msg_text += f"\n🗑 Skipped {duplicate_count} duplicate links in current queue session."
             msg_text += f"\nTotal in Queue: {len(USER_QUEUES[uid])}"
             msg = await update.message.reply_text(msg_text)
             await asyncio.sleep(3)
@@ -1708,7 +1702,7 @@ async def start_background_tasks(application: Application):
     except Exception as e:
         print(f"[{datetime.now()}] ❌ Failed to start Global Pyrogram Bot: {e}")
 
-    load_seen_links()
+    # load_seen_links() - Removed entirely as duplicate memory is no longer required globally.
     asyncio.create_task(auto_scraper_loop())
     print(f"[{datetime.now()}] 🟢 Background Auto-Scraper Task Started Successfully!")
 
@@ -1719,9 +1713,10 @@ def main():
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     
-    print(f"[{datetime.now()}] 🟢 Bot is running with Multi-Scraper & Smart Memory System...")
+    print(f"[{datetime.now()}] 🟢 Bot is running with Updated Scraper & Advanced Checker Memory...")
     
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
+
