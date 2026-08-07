@@ -1,4 +1,4 @@
 python-telegram-bot
 kurigram
 aiohttp
-tgcrypto
+pytgcrypto
