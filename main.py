@@ -60,7 +60,7 @@ STORAGE_STATE_FILE = "storage_state.json"
 
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 
-# VPS Logging Upgraded to INFO so you can see live status on Terminal
+# VPS Logging
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -79,6 +79,7 @@ CHECKER_DUPLICATES = {}
 
 CHECKER_STATE = {}
 SCRAPER_TASKS = {}
+EXTRACTOR_TASKS = {} # New lock for media extractor
 
 # ─────────────────────────────────────────
 #  JSON STATE LOADERS
@@ -186,6 +187,24 @@ def parse_link(link: str) -> tuple[bool, str]:
     m = re.search(r"t\.me/([a-zA-Z0-9_]+)", link)
     if m: return False, m.group(1)
     return False, link
+
+# --- NEW: PARSE MESSAGE LINKS FOR EXTRACTOR ---
+def parse_msg_link(link: str):
+    link = link.strip().rstrip("/")
+    try:
+        if "/c/" in link:
+            parts = link.split("/c/")[1].split("/")
+            chat_id = int("-100" + parts[0])
+            msg_id = int(parts[1]) if len(parts) > 1 else 0
+            return chat_id, msg_id
+        elif "t.me/" in link:
+            parts = link.split("t.me/")[1].split("/")
+            chat_username = parts[0].split("?")[0]
+            msg_id = int(parts[1].split("?")[0]) if len(parts) > 1 else 0
+            return chat_username, msg_id
+    except:
+        pass
+    return None, 0
 
 async def fast_http_link_check(link: str) -> str:
     link = link.strip().rstrip("-.,_ \n\t*`~")
@@ -418,6 +437,131 @@ async def dispatch_result(r: dict, stats_tracker: dict):
         await _send_raw(SKIPPED_CHANNEL_ID, f"<b>⚠️ SKIPPED LINK</b>\n━━━━━━━━━━\n{msg}")
 
 # ─────────────────────────────────────────
+#  NEW: RESTRICTED MEDIA EXTRACTOR (SINGLE & BULK)
+# ─────────────────────────────────────────
+async def process_and_send_media(app, msg, dest_id, cid, status_msg_id=None):
+    """Core logic to bypass restricted content by downloading and uploading"""
+    if not msg or msg.empty: return False
+    
+    caption = msg.caption or ""
+    try:
+        if getattr(msg, 'has_protected_content', False):
+            # Restricted Media - Must Download & Upload
+            if status_msg_id:
+                await _edit_raw(cid, status_msg_id, "📥 <b>Downloading restricted media to VPS...</b>\n<i>Please wait, this might take time depending on file size.</i>")
+            
+            file_path = await app.download_media(msg)
+            if not file_path: return False
+
+            if status_msg_id:
+                await _edit_raw(cid, status_msg_id, "📤 <b>Uploading media to destination...</b>")
+
+            if msg.video:
+                await app.send_video(dest_id, video=file_path, caption=caption)
+            elif msg.document:
+                await app.send_document(dest_id, document=file_path, caption=caption)
+            elif msg.photo:
+                await app.send_photo(dest_id, photo=file_path, caption=caption)
+            elif msg.audio:
+                await app.send_audio(dest_id, audio=file_path, caption=caption)
+            else:
+                # Text or other unsupported protected
+                await app.send_message(dest_id, text=msg.text or "Unknown Protected Media")
+            
+            # Clean up VPS storage
+            if os.path.exists(file_path):
+                os.remove(file_path)
+            return True
+        else:
+            # Normal Media - Just Copy/Forward
+            await msg.copy(dest_id)
+            return True
+    except FloodWait as e:
+        await asyncio.sleep(e.value + 2)
+        return False
+    except Exception as e:
+        logger.error(f"Error processing media: {e}")
+        return False
+
+async def _run_media_extractor(uid: int, cid: int, target_link: str, mode: str, dest_id: int):
+    scraper_sessions = get_user_sessions(uid, "scraper")
+    if not scraper_sessions:
+        await _send_raw(cid, "❌ <b>No Scraper ID logged in!</b>\nPlease add an account in Scraper Menu first.")
+        return
+
+    chat_id, start_msg_id = parse_msg_link(target_link)
+    if not chat_id or not start_msg_id:
+        await _send_raw(cid, "❌ <b>Invalid Post Link!</b>\nPlease provide a direct link to a message (e.g., t.me/c/12345/67)")
+        return
+
+    app = Client(scraper_sessions[0], api_id=API_ID, api_hash=API_HASH, no_updates=True)
+    
+    prog_resp = await _send_raw(cid, "🔄 <b>Connecting Scraper ID to extract media...</b>")
+    status_msg_id = prog_resp.get("result", {}).get("message_id") if isinstance(prog_resp, dict) else None
+
+    try:
+        await app.connect()
+        
+        # Verify Chat Access
+        try:
+            chat = await app.get_chat(chat_id)
+        except Exception as e:
+            await _edit_raw(cid, status_msg_id, f"❌ <b>Scraper ID cannot access this chat!</b>\nError: {e}\n<i>Make sure the Scraper ID has joined the group/channel.</i>")
+            await app.disconnect()
+            return
+
+        if mode == "single":
+            msg = await app.get_messages(chat.id, start_msg_id)
+            success = await process_and_send_media(app, msg, dest_id, cid, status_msg_id)
+            if success:
+                await _edit_raw(cid, status_msg_id, f"✅ <b>Successfully Extracted Single Post!</b>\nSent to: <code>{dest_id}</code>")
+            else:
+                await _edit_raw(cid, status_msg_id, "❌ <b>Failed to extract media.</b> (Message might be deleted or unsupported type)")
+
+        elif mode == "bulk":
+            await _edit_raw(cid, status_msg_id, f"🔄 <b>Starting Bulk Extraction...</b>\nFrom Message ID: <code>{start_msg_id}</code> onwards.\n<i>Sending to: {dest_id}</i>")
+            
+            extracted_count = 0
+            current_msg_id = start_msg_id
+            
+            # Fetch sequentially upwards
+            while True:
+                try:
+                    msgs = await app.get_messages(chat.id, list(range(current_msg_id, current_msg_id + 10)))
+                    valid_msgs = [m for m in msgs if m and not m.empty]
+                    
+                    if not valid_msgs and current_msg_id > start_msg_id + 50: 
+                        # Stop if we hit a long empty patch (end of chat)
+                        break
+
+                    for msg in valid_msgs:
+                        if msg.id >= current_msg_id:
+                            success = await process_and_send_media(app, msg, dest_id, cid, None)
+                            if success:
+                                extracted_count += 1
+                                if extracted_count % 5 == 0:
+                                    await _edit_raw(cid, status_msg_id, f"🔄 <b>Bulk Extraction in Progress...</b>\nExtracted: <code>{extracted_count}</code> posts so far.")
+                            await asyncio.sleep(2) # Delay to avoid floodwaits during bulk
+                    
+                    current_msg_id += 10
+                    
+                except FloodWait as fw:
+                    await asyncio.sleep(fw.value + 5)
+                except Exception as e:
+                    break
+
+            await _edit_raw(cid, status_msg_id, f"✅ <b>Bulk Extraction Complete!</b>\nTotal Extracted: <code>{extracted_count}</code> posts.")
+
+    except Exception as e:
+        if status_msg_id:
+            await _edit_raw(cid, status_msg_id, f"❌ <b>Extraction Crashed:</b> {e}")
+        logger.error(f"Extractor Error: {e}")
+    finally:
+        try: await app.disconnect()
+        except: pass
+        EXTRACTOR_TASKS[uid] = False
+
+# ─────────────────────────────────────────
 #  SCRAPER & AUTO-UPDATES (SMART MEMORY)
 # ─────────────────────────────────────────
 async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True):
@@ -465,9 +609,8 @@ async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True):
                         parts = chat_target.split("/c/")[1].split("/")
                         chat_id = int("-100" + parts[0])
                         chat = await app.get_chat(chat_id)
-                        # If a specific message was linked, we can use it to update last_msg_id intelligently
                         if len(parts) > 1 and last_msg_id == 0:
-                            last_msg_id = int(parts[1]) - 1 # Start scraping from that message
+                            last_msg_id = int(parts[1]) - 1 
                     else:
                         username = chat_target.split("t.me/")[1].split("/")[0].split("?")[0]
                         chat = await app.get_chat(username)
@@ -881,6 +1024,7 @@ def PRO_KB(uid):
     return [
         [{"text": f"🏦 Checker Bank ({len(checker_sessions)} Active)", "callback_data": "menu_accounts"}],
         [{"text": f"🕷️ Scraper Accounts & Targets ({len(scraper_sessions)} Active)", "callback_data": "menu_scraper"}],
+        [{"text": "🎥 Media Extractor (Restricted)", "callback_data": "menu_extractor"}], # NEW FEATURE BUTTON
         [{"text": "📥 Trigger Smart Scrape Now", "callback_data": "scraper_today"}],
         [{"text": "🔗 Check Links (Manual)", "callback_data": "menu_check"}],
         [{"text": "⚙️ Settings", "callback_data": "menu_settings"}],
@@ -921,6 +1065,25 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         state = load_scraper_state(uid)
         daily_stats = state.get("daily_stats", 0)
         await _edit_raw(cid, mid, f"👑 <b>Link Pro Dashboard</b>\n\n📊 <b>Scraping Status Today:</b> {daily_stats} Links Extracted\n\nWelcome to the advanced menu. Automate your work seamlessly.", PRO_KB(uid))
+
+    elif d == "menu_extractor":
+        kb = [
+            [{"text": "📌 Extract Single Post", "callback_data": "ext_single"}],
+            [{"text": "📚 Extract Bulk (All below link)", "callback_data": "ext_bulk"}],
+            [{"text": "🔙 Back", "callback_data": "menu_pro"}]
+        ]
+        await _edit_raw(cid, mid, "🎥 <b>Restricted Media Extractor</b>\n\nChoose extraction mode:\n\n"
+                                  "1. <b>Single Post:</b> Extracts only the specific message link you provide.\n"
+                                  "2. <b>Bulk:</b> Extracts the provided message AND all messages posted after it.\n\n"
+                                  "<i>Note: Media will be downloaded by Scraper ID and sent to your Admin ID.</i>", kb)
+
+    elif d == "ext_single":
+        ctx.user_data["mode"] = "ext_single_wait"
+        await _edit_raw(cid, mid, "📌 <b>Single Post Extraction</b>\n\nSend the exact message link (e.g. `t.me/c/123456/789`).\n\n<i>Make sure your Scraper ID has joined the target group/bot!</i>", [[{"text": "🔙 Cancel", "callback_data": "menu_extractor"}]])
+
+    elif d == "ext_bulk":
+        ctx.user_data["mode"] = "ext_bulk_wait"
+        await _edit_raw(cid, mid, "📚 <b>Bulk Post Extraction</b>\n\nSend the STARTING message link.\nBot will extract that message and ALL messages posted after it sequentially.\n\n<i>Make sure your Scraper ID has joined!</i>", [[{"text": "🔙 Cancel", "callback_data": "menu_extractor"}]])
 
     elif d.startswith("tog_id_"):
         c_key = d.split("tog_id_")[1]
@@ -1095,6 +1258,25 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if text == "/start": return 
 
+    # --- NEW: EXTRACTOR MESSAGE HANDLERS ---
+    if mode in ["ext_single_wait", "ext_bulk_wait"]:
+        if EXTRACTOR_TASKS.get(uid):
+            await update.message.reply_text("⚠️ Extraction already running. Please wait.")
+            return
+        
+        if "t.me/" not in text:
+            await update.message.reply_text("❌ Please provide a valid Telegram message link.")
+            return
+            
+        EXTRACTOR_TASKS[uid] = True
+        ext_mode = "single" if mode == "ext_single_wait" else "bulk"
+        ctx.user_data["mode"] = "" # Reset mode
+        
+        # Start background extraction task
+        asyncio.create_task(_run_media_extractor(uid, cid, text, ext_mode, ADMIN_ID))
+        return
+    # ---------------------------------------
+
     if mode == "guest_check":
         links = extract_links(text)
         if not links:
@@ -1132,7 +1314,6 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             target_val = str(update.message.forward_from_chat.id)
         else:
             text_val = text.strip()
-            # If user sends a link, username, or raw ID, save it directly
             if "t.me/" in text_val or text_val.startswith("-100") or text_val.startswith("@") or text_val.isdigit():
                 target_val = text_val
             
