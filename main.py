@@ -168,7 +168,7 @@ def track_user(uid: int):
             with open(USERS_FILE, "a") as f: f.write(f"{uid}\n")
     except: pass
 
-def extract_links(text: str) -> list[str]:
+def extract_links(text: str) -> list:
     raw = re.findall(r"(?:https?://)?t\.me/(?:joinchat/|\+)?[a-zA-Z0-9_\-+]+", text)
     out = []
     seen = set()
@@ -180,7 +180,7 @@ def extract_links(text: str) -> list[str]:
             out.append(lnk)
     return out
 
-def parse_link(link: str) -> tuple[bool, str]:
+def parse_link(link: str) -> tuple:
     link = link.strip().rstrip("-.,_ \n\t*`~")
     m = re.search(r"t\.me/(?:joinchat/|\+)([A-Za-z0-9_\-]+)", link)
     if m: return True, m.group(1).rstrip("-")
@@ -188,23 +188,30 @@ def parse_link(link: str) -> tuple[bool, str]:
     if m: return False, m.group(1)
     return False, link
 
-# --- NEW: PARSE MESSAGE LINKS FOR EXTRACTOR ---
+# --- UPGRADED: PARSE MESSAGE LINKS FOR EXTRACTOR (BOT DEEP-LINK SAFE) ---
 def parse_msg_link(link: str):
     link = link.strip().rstrip("/")
     try:
         if "/c/" in link:
             parts = link.split("/c/")[1].split("/")
             chat_id = int("-100" + parts[0])
-            msg_id = int(parts[1]) if len(parts) > 1 else 0
+            msg_id = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 1
             return chat_id, msg_id
         elif "t.me/" in link:
-            parts = link.split("t.me/")[1].split("/")
+            url_part = link.split("t.me/")[1]
+            parts = url_part.split("/")
             chat_username = parts[0].split("?")[0]
-            msg_id = int(parts[1].split("?")[0]) if len(parts) > 1 else 0
+            
+            msg_id = 1
+            if len(parts) > 1:
+                maybe_id = parts[1].split("?")[0]
+                if maybe_id.isdigit():
+                    msg_id = int(maybe_id)
+                    
             return chat_username, msg_id
-    except:
+    except Exception:
         pass
-    return None, 0
+    return None, None
 
 async def fast_http_link_check(link: str) -> str:
     link = link.strip().rstrip("-.,_ \n\t*`~")
@@ -437,16 +444,14 @@ async def dispatch_result(r: dict, stats_tracker: dict):
         await _send_raw(SKIPPED_CHANNEL_ID, f"<b>⚠️ SKIPPED LINK</b>\n━━━━━━━━━━\n{msg}")
 
 # ─────────────────────────────────────────
-#  NEW: RESTRICTED MEDIA EXTRACTOR (SINGLE & BULK)
+#  UPGRADED: RESTRICTED MEDIA EXTRACTOR (SINGLE, BULK & BOT DEEP-LINKS)
 # ─────────────────────────────────────────
 async def process_and_send_media(app, msg, dest_id, cid, status_msg_id=None):
-    """Core logic to bypass restricted content by downloading and uploading"""
     if not msg or msg.empty: return False
     
     caption = msg.caption or ""
     try:
         if getattr(msg, 'has_protected_content', False):
-            # Restricted Media - Must Download & Upload
             if status_msg_id:
                 await _edit_raw(cid, status_msg_id, "📥 <b>Downloading restricted media to VPS...</b>\n<i>Please wait, this might take time depending on file size.</i>")
             
@@ -465,15 +470,12 @@ async def process_and_send_media(app, msg, dest_id, cid, status_msg_id=None):
             elif msg.audio:
                 await app.send_audio(dest_id, audio=file_path, caption=caption)
             else:
-                # Text or other unsupported protected
                 await app.send_message(dest_id, text=msg.text or "Unknown Protected Media")
             
-            # Clean up VPS storage
             if os.path.exists(file_path):
                 os.remove(file_path)
             return True
         else:
-            # Normal Media - Just Copy/Forward
             await msg.copy(dest_id)
             return True
     except FloodWait as e:
@@ -490,8 +492,8 @@ async def _run_media_extractor(uid: int, cid: int, target_link: str, mode: str, 
         return
 
     chat_id, start_msg_id = parse_msg_link(target_link)
-    if not chat_id or not start_msg_id:
-        await _send_raw(cid, "❌ <b>Invalid Post Link!</b>\nPlease provide a direct link to a message (e.g., t.me/c/12345/67)")
+    if not chat_id:
+        await _send_raw(cid, "❌ <b>Invalid Post Link!</b>\nPlease provide a direct link to a message or bot (e.g., t.me/c/12345/67 or Bot Link)")
         return
 
     app = Client(scraper_sessions[0], api_id=API_ID, api_hash=API_HASH, no_updates=True)
@@ -502,13 +504,25 @@ async def _run_media_extractor(uid: int, cid: int, target_link: str, mode: str, 
     try:
         await app.connect()
         
-        # Verify Chat Access
         try:
             chat = await app.get_chat(chat_id)
         except Exception as e:
-            await _edit_raw(cid, status_msg_id, f"❌ <b>Scraper ID cannot access this chat!</b>\nError: {e}\n<i>Make sure the Scraper ID has joined the group/channel.</i>")
+            await _edit_raw(cid, status_msg_id, f"❌ <b>Scraper ID cannot access this chat!</b>\nError: {e}\n<i>Make sure the Scraper ID has joined the group/channel/bot.</i>")
             await app.disconnect()
             return
+
+        # --- NEW SMART BOT DEEP-LINK HANDLER ---
+        if "?start=" in target_link:
+            try:
+                payload = target_link.split("?start=")[1].split("&")[0]
+                sent_msg = await app.send_message(chat.id, f"/start {payload}")
+                await _edit_raw(cid, status_msg_id, f"🤖 <b>Bot Deep Link Detected!</b>\nSent <code>/start {payload}</code> to {chat.first_name or chat.username}.\n<i>Waiting for bot to reply with media...</i>")
+                await asyncio.sleep(4)
+                
+                start_msg_id = sent_msg.id
+                mode = "bulk" 
+            except Exception as e:
+                logger.error(f"Failed to send start payload: {e}")
 
         if mode == "single":
             msg = await app.get_messages(chat.id, start_msg_id)
@@ -523,25 +537,31 @@ async def _run_media_extractor(uid: int, cid: int, target_link: str, mode: str, 
             
             extracted_count = 0
             current_msg_id = start_msg_id
+            empty_patches = 0
             
-            # Fetch sequentially upwards
             while True:
                 try:
                     msgs = await app.get_messages(chat.id, list(range(current_msg_id, current_msg_id + 10)))
                     valid_msgs = [m for m in msgs if m and not m.empty]
                     
-                    if not valid_msgs and current_msg_id > start_msg_id + 50: 
-                        # Stop if we hit a long empty patch (end of chat)
-                        break
+                    if not valid_msgs:
+                        empty_patches += 1
+                        if empty_patches > 5: 
+                            break
+                    else:
+                        empty_patches = 0
 
                     for msg in valid_msgs:
                         if msg.id >= current_msg_id:
+                            if msg.text and msg.text.startswith("/start"):
+                                continue
+                                
                             success = await process_and_send_media(app, msg, dest_id, cid, None)
                             if success:
                                 extracted_count += 1
                                 if extracted_count % 5 == 0:
                                     await _edit_raw(cid, status_msg_id, f"🔄 <b>Bulk Extraction in Progress...</b>\nExtracted: <code>{extracted_count}</code> posts so far.")
-                            await asyncio.sleep(2) # Delay to avoid floodwaits during bulk
+                            await asyncio.sleep(2)
                     
                     current_msg_id += 10
                     
@@ -591,7 +611,6 @@ async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True):
         for target, last_msg_id in targets.items():
             print(f"[{datetime.now()}] 📡 Resolving & Scraping target: {target}")
             try:
-                # --- NEW SMART LINK RESOLVER LOGIC ---
                 chat_target = target
                 try: 
                     chat_target = int(target)
@@ -616,7 +635,6 @@ async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True):
                         chat = await app.get_chat(username)
                 else:
                     chat = await app.get_chat(chat_target)
-                # -------------------------------------
 
                 if not chat:
                     print(f"[{datetime.now()}] ⚠️ Could not resolve chat for target {target}")
@@ -1024,7 +1042,7 @@ def PRO_KB(uid):
     return [
         [{"text": f"🏦 Checker Bank ({len(checker_sessions)} Active)", "callback_data": "menu_accounts"}],
         [{"text": f"🕷️ Scraper Accounts & Targets ({len(scraper_sessions)} Active)", "callback_data": "menu_scraper"}],
-        [{"text": "🎥 Media Extractor (Restricted)", "callback_data": "menu_extractor"}], # NEW FEATURE BUTTON
+        [{"text": "🎥 Media Extractor (Restricted)", "callback_data": "menu_extractor"}], 
         [{"text": "📥 Trigger Smart Scrape Now", "callback_data": "scraper_today"}],
         [{"text": "🔗 Check Links (Manual)", "callback_data": "menu_check"}],
         [{"text": "⚙️ Settings", "callback_data": "menu_settings"}],
@@ -1258,24 +1276,21 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if text == "/start": return 
 
-    # --- NEW: EXTRACTOR MESSAGE HANDLERS ---
     if mode in ["ext_single_wait", "ext_bulk_wait"]:
         if EXTRACTOR_TASKS.get(uid):
             await update.message.reply_text("⚠️ Extraction already running. Please wait.")
             return
         
         if "t.me/" not in text:
-            await update.message.reply_text("❌ Please provide a valid Telegram message link.")
+            await update.message.reply_text("❌ Please provide a valid Telegram message or bot link.")
             return
             
         EXTRACTOR_TASKS[uid] = True
         ext_mode = "single" if mode == "ext_single_wait" else "bulk"
-        ctx.user_data["mode"] = "" # Reset mode
+        ctx.user_data["mode"] = "" 
         
-        # Start background extraction task
         asyncio.create_task(_run_media_extractor(uid, cid, text, ext_mode, ADMIN_ID))
         return
-    # ---------------------------------------
 
     if mode == "guest_check":
         links = extract_links(text)
@@ -1298,7 +1313,6 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         res_text += "\n<i>(For advanced stats, login via Link Pro)</i>"
         await msg.edit_text(res_text, disable_web_page_preview=True, parse_mode="HTML")
 
-    # --- UPDATED TARGET ADDING LOGIC ---
     elif mode == "scraper_target":
         state = load_scraper_state(uid)
         target_val = None
@@ -1357,7 +1371,6 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 
             print(f"[{datetime.now()}] 📱 Attempting to send OTP to {text}")
             
-            # --- THE FIX: ADDED DEVICE DETAILS TO FORCE OTP IN APP ---
             app = Client(
                 os.path.join(SESSIONS_DIR, s_name), 
                 api_id=API_ID, 
