@@ -444,24 +444,36 @@ async def try_check_link(app: Client, link: str):
                 except: pass
             if mem_count: result["members"] = str(mem_count)
             
-            # Initial forward check
+            # Initial forward check (Bulletproof Check Added Here)
             has_protected = bool(getattr(chat, 'has_protected_content', False))
+            
+            if not has_protected:
+                try:
+                    # Fetching 1 latest message to double check if the channel actually restricted forwarding
+                    async for m_test in app.get_chat_history(chat.id, limit=1):
+                        if getattr(m_test, 'has_protected_content', False):
+                            has_protected = True
+                        break
+                except:
+                    pass
+            
             result["forward"] = "❌ Off" if has_protected else "✅ On"
             
+            # Chatting and Add Member Check (Refined Permissions Logic)
             if getattr(chat, 'type', None) in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP]:
-                if chat.permissions:
-                    can_txt = chat.permissions.can_send_messages
-                    can_med = chat.permissions.can_send_media_messages
-                    can_inv = chat.permissions.can_invite_users
+                can_txt = True
+                can_med = True
+                can_inv = True
+                if getattr(chat, 'permissions', None):
+                    can_txt = getattr(chat.permissions, 'can_send_messages', True)
+                    can_med = getattr(chat.permissions, 'can_send_media_messages', True)
+                    can_inv = getattr(chat.permissions, 'can_invite_users', True)
                     
-                    result["chatting"] = "✅ On" if can_txt else "❌ Off"
-                    result["add_member"] = "✅ On" if can_inv else "❌ Off"
-                    
-                    if can_med and not can_txt:
-                        result["media_only"] = True
-                else:
-                    result["chatting"] = "✅ On" 
-                    result["add_member"] = "✅ On"
+                result["chatting"] = "✅ On" if can_txt else "❌ Off"
+                result["add_member"] = "✅ On" if can_inv else "❌ Off"
+                
+                if can_med and not can_txt:
+                    result["media_only"] = True
             elif getattr(chat, 'type', None) == enums.ChatType.CHANNEL:
                 result["chatting"] = "❌ Off (Channel)"
                 result["add_member"] = "❌ Off (Channel)"
@@ -486,8 +498,18 @@ async def try_check_link(app: Client, link: str):
                             
                             # Re-fetch chat object to ensure has_protected_content is updated accurately
                             chat = await app.get_chat(chat.id)
-                            has_protected = bool(getattr(chat, 'has_protected_content', False))
-                            result["forward"] = "❌ Off" if has_protected else "✅ On"
+                            has_protected_new = bool(getattr(chat, 'has_protected_content', False))
+                            
+                            if not has_protected_new:
+                                try:
+                                    async for m_test in app.get_chat_history(chat.id, limit=1):
+                                        if getattr(m_test, 'has_protected_content', False):
+                                            has_protected_new = True
+                                        break
+                                except:
+                                    pass
+                                    
+                            result["forward"] = "❌ Off" if has_protected_new else "✅ On"
                             
                             result["videos"] = str(await app.search_messages_count(chat.id, filter=enums.MessagesFilter.VIDEO))
                             break
