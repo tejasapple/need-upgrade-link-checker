@@ -269,7 +269,7 @@ def parse_msg_link(link: str):
 async def fast_http_link_check(link: str) -> str:
     link = link.strip().rstrip("-.,_ \n\t*`~")
     
-    # User Request: Do baar check karo (Retry mechanism for accuracy 3 times)
+    # Do baar check karo (Retry mechanism for accuracy 3 times)
     for _ in range(3): 
         try:
             async with aiohttp.ClientSession() as s:
@@ -281,29 +281,51 @@ async def fast_http_link_check(link: str) -> str:
                 async with s.get(link, timeout=5, headers=headers, allow_redirects=True) as resp:
                     if resp.status == 200:
                         text = await resp.text()
+                        lower_text = text.lower()
                         
-                        # 1. 100% Strict check for Expired / Invalid text
+                        # 1. BANNED / VIOLATED CHECK (Treat as Expired)
+                        banned_phrases = [
+                            "violated",
+                            "copyright",
+                            "cannot be displayed",
+                            "banned",
+                            "inaccessible",
+                            "pornographic",
+                            "terms of service",
+                            "this channel is unavailable"
+                        ]
+                        if any(phrase in lower_text for phrase in banned_phrases):
+                            return "expired"
+                            
+                        # 2. EXPIRED / INVALID CHECK
                         expired_phrases = [
-                            "Invite link is invalid", 
-                            "Link is invalid", 
+                            "invite link is invalid", 
+                            "link is invalid", 
                             "has expired",
                             "tgme_page_icon_error",
                             "not found",
-                            "is inaccessible",
                             "user does not exist",
                             "no longer valid",
                             "doesn't exist"
                         ]
-                        if any(phrase in text for phrase in expired_phrases):
+                        if any(phrase in lower_text for phrase in expired_phrases):
                             return "expired"
                             
-                        # 2. 100% Strict check for Active links
-                        # Only legitimate active links will display the Telegram action button
-                        if 'class="tgme_action_button_new"' in text or 'class="tgme_page_button_new"' in text:
+                        # 3. STRICT ACTIVE CHECK (Expanded indicators)
+                        active_indicators = [
+                            'tgme_action_button', 
+                            'tgme_page_button', 
+                            'Join Channel', 
+                            'Join Group', 
+                            'View in Telegram', 
+                            'View Channel', 
+                            'Send Message'
+                        ]
+                        if any(indicator in text for indicator in active_indicators):
                             return "active"
                             
-                        # 3. Fallback: if page loaded properly but has no active button -> Expired
-                        if 'tgme_page_wrap' in text or 'tgme_page_title' in text:
+                        # 4. Fallback: if page loaded properly but has no active indicators -> Expired
+                        if 'tgme_page_wrap' in lower_text or 'tgme_page_title' in lower_text:
                             return "expired"
                             
                     elif resp.status == 404:
