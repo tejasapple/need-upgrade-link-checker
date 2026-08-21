@@ -266,7 +266,7 @@ def parse_msg_link(link: str):
     return None, None
 
 # ─────────────────────────────────────────
-#  HTTP LINK CHECKER (FIXED & ULTRA-STRICT METHOD)
+#  HTTP LINK CHECKER (FIXED GUEST MODE FOR BANNED CHANNELS)
 # ─────────────────────────────────────────
 async def check_public_via_http(link: str, attempt=1) -> dict:
     is_private, _ = parse_link(link)
@@ -295,43 +295,50 @@ async def check_public_via_http(link: str, attempt=1) -> dict:
             "not found", "user does not exist", "doesn't exist",
             "tgme_page_icon_error", "violated", "copyright", 
             "cannot be displayed", "banned", "inaccessible", 
-            "pornographic", "terms of service", "this channel is unavailable"
+            "pornographic", "terms of service", "this channel is unavailable",
+            "this group can't be displayed"
         ]
         
         if any(phrase in lower_text for phrase in dead_phrases):
-            result["status"] = "expired"; result["title"] = "Expired / Invalid"
+            result["status"] = "expired"; result["title"] = "Expired / Banned"
             return result
         
         # 2. Extract meta title to verify if it's just a default Telegram page
         m_title = re.search(r'<meta property="og:title"\s+content="([^"]+)"', html_text)
         title = m_title.group(1).strip() if m_title else ""
         
-        # If title is generic, the link didn't resolve to a real chat/group and redirected
         generic_titles = {"telegram", "telegram messenger", "join group chat on telegram", "join channel on telegram"}
         
-        if not title or title.lower() in generic_titles:
+        # Check if title is generic OR starts with "Telegram: Contact" (which happens for banned/dead public links)
+        if not title or title.lower() in generic_titles or title.lower().startswith("telegram: contact"):
             result["status"] = "expired"; result["title"] = "Expired / Invalid"
             return result
 
         # 3. IF IT PASSED THE ABOVE, CHECK FOR ACTIVE BUTTONS/CONTENT
+        has_action_btn = bool(re.search(r'tgme_action_button|btn_join|"Join\s+(Group|Channel|Chat)"', html_text, re.I))
+
         if is_private:
             # Additional strict check for private links
-            if not bool(re.search(r'tgme_action_button|btn_join|"Join\s+(Group|Channel|Chat)"', html_text, re.I)):
+            if not has_action_btn:
                 result["status"] = "expired"; result["title"] = "Expired Link"
             else:
                 result["status"] = "active"
                 result["title"] = title if title else "Private Chat"
         else:
-            m_desc = re.search(r'<meta property="og:description"\s+content="([^"]+)"', html_text)
-            desc = m_desc.group(1).strip() if m_desc else ""
-            
-            mc = re.search(r'class="tgme_page_extra"[^>]*>\s*([\d\s,.\xa0KMB]+)\s*(?:members?|subscribers?)', html_text, re.I)
-            if not mc: mc = re.search(r"([\d\s,.\xa0KMB]+)\s*(?:members?|subscribers?)", desc, re.I)
-            
-            result["status"] = "active"
-            result["title"] = title
-            if mc: result["members"] = mc.group(1).replace('\xa0', ' ').strip()
-            else: result["members"] = "N/A"
+            if not has_action_btn:
+                # Banned/Dead public links lose their action buttons
+                result["status"] = "expired"; result["title"] = "Expired / Banned"
+            else:
+                m_desc = re.search(r'<meta property="og:description"\s+content="([^"]+)"', html_text)
+                desc = m_desc.group(1).strip() if m_desc else ""
+                
+                mc = re.search(r'class="tgme_page_extra"[^>]*>\s*([\d\s,.\xa0KMB]+)\s*(?:members?|subscribers?)', html_text, re.I)
+                if not mc: mc = re.search(r"([\d\s,.\xa0KMB]+)\s*(?:members?|subscribers?)", desc, re.I)
+                
+                result["status"] = "active"
+                result["title"] = title
+                if mc: result["members"] = mc.group(1).replace('\xa0', ' ').strip()
+                else: result["members"] = "N/A"
         
     except Exception as e:
         result["status"] = "error"; result["title"] = str(e)[:60]
