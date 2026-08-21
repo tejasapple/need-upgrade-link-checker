@@ -24,7 +24,7 @@ from pyrogram.errors import (
 # --- NEW RAW API IMPORTS ADDED HERE ---
 from pyrogram.raw.functions.messages import CheckChatInvite, GetFullChat, GetSearchCounters
 from pyrogram.raw.functions.channels import GetFullChannel
-from pyrogram.raw.types import ChatInviteAlready, ChatInvite, InputMessagesFilterVideo, InputMessagesFilterPhoto
+from pyrogram.raw.types import ChatInviteAlready, ChatInvite, InputMessagesFilterVideo, InputMessagesFilterPhotos
 
 # ─────────────────────────────────────────
 #  CONFIG & INITIALIZATION
@@ -459,7 +459,7 @@ async def try_check_link(app: Client, link: str):
                 counters = await app.invoke(
                     GetSearchCounters(
                         peer=peer,
-                        filters=[InputMessagesFilterVideo(), InputMessagesFilterPhoto()]
+                        filters=[InputMessagesFilterVideo(), InputMessagesFilterPhotos()]
                     )
                 )
                 v_count = 0
@@ -467,7 +467,7 @@ async def try_check_link(app: Client, link: str):
                 for counter in counters:
                     if isinstance(counter.filter, InputMessagesFilterVideo):
                         v_count = counter.count
-                    elif isinstance(counter.filter, InputMessagesFilterPhoto):
+                    elif isinstance(counter.filter, InputMessagesFilterPhotos):
                         p_count = counter.count
                 
                 result["videos"] = str(v_count)
