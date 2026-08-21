@@ -62,12 +62,12 @@ PYRO_BOT = Client(
 #  DYNAMIC CONFIGURATION SYSTEM
 # ─────────────────────────────────────────
 DEFAULT_CONFIG = {
-    "STORAGE_CHANNEL_ID":-1003990522650,
+    "STORAGE_CHANNEL_ID": -1003990522650,
     "ACTIVE_CHANNEL_ID": -1003584008473,
     "EXPIRED_CHANNEL_ID": -1003703360954,
     "FORWARD_ON_CHANNEL_ID": -1004266075606 ,
     "CHATTING_ON_CHANNEL_ID": -1004290819639,
-    "SKIPPED_CHANNEL_ID":-1003703360954,
+    "SKIPPED_CHANNEL_ID": -1003703360954,
     "MEMBERS_LESS_1000_ID": -1004367240483,
     "MEMBERS_1000_2500_ID": -1004367240483,
     "MEMBERS_2500_5000_ID": -1004367240483,
@@ -288,7 +288,6 @@ async def check_public_via_http(link: str, attempt=1) -> dict:
 
         lower_text = html_text.lower()
         
-        # 1. BANNED / EXPIRED SIGNATURES (Broad check for dead links)
         dead_phrases = [
             "invite link is invalid", "link is invalid", "has expired", 
             "no longer valid", "not valid", "invalid invite",
@@ -303,7 +302,6 @@ async def check_public_via_http(link: str, attempt=1) -> dict:
             result["status"] = "expired"; result["title"] = "Expired / Banned"
             return result
         
-        # 2. Extract meta title to verify if it's just a default Telegram page
         m_title = re.search(r'<meta property="og:title"\s+content="([^"]+)"', html_text)
         title = m_title.group(1).strip() if m_title else ""
         
@@ -313,7 +311,6 @@ async def check_public_via_http(link: str, attempt=1) -> dict:
             result["status"] = "expired"; result["title"] = "Expired / Invalid"
             return result
 
-        # 3. IF IT PASSED THE ABOVE, CHECK FOR ACTIVE BUTTONS/CONTENT
         has_action_btn = bool(re.search(r'tgme_action_button|btn_join|"Join\s+(Group|Channel|Chat)"', html_text, re.I))
 
         if is_private:
@@ -346,6 +343,9 @@ async def check_public_via_http(link: str, attempt=1) -> dict:
         
     return result
 
+# ─────────────────────────────────────────
+#  DEEP LINK CHECKER PRO (COMPLETELY FIXED)
+# ─────────────────────────────────────────
 async def try_check_link(app: Client, link: str):
     is_private, ref = parse_link(link)
     result = {
@@ -359,17 +359,8 @@ async def try_check_link(app: Client, link: str):
     joined_now = False
 
     try:
-        if not is_private:
-            try:
-                chat = await app.get_chat(ref)
-                if getattr(chat, 'type', None) not in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP, enums.ChatType.CHANNEL]:
-                    raise UsernameInvalid("Not a group or channel")
-            except Exception:
-                chat = await app.join_chat(link)
-                joined_now = True
-                await asyncio.sleep(2)
-                chat = await app.get_chat(chat.id)
-        else:
+        # STEP 1: RESOLVE AND FORCE JOIN CHAT
+        if is_private:
             inv = await app.invoke(CheckChatInvite(hash=ref))
             
             if hasattr(inv, 'title'): 
@@ -383,44 +374,45 @@ async def try_check_link(app: Client, link: str):
                 result["members"] = str(inv.chat.participants_count)
 
             if isinstance(inv, ChatInviteAlready):
-                try: chat = await app.get_chat(inv.chat.id)
-                except: 
+                try: 
+                    chat = await app.get_chat(inv.chat.id)
+                except Exception: 
                     try: chat = await app.get_chat(int(f"-100{inv.chat.id}"))
                     except: pass
             elif isinstance(inv, ChatInvite):
-                retry_count = 0
-                while retry_count <= 2:
-                    try:
-                        chat = await app.join_chat(link)
-                        joined_now = True
-                        await asyncio.sleep(2) 
-                        try: chat = await app.get_chat(chat.id)
-                        except: pass
-                        break
-                    except UserAlreadyParticipant:
-                        try: chat = await app.get_chat(link)
-                        except: pass
-                        break
-                    except Exception as inner_e:
-                        err_msg = str(inner_e).lower()
-                        if "invite_request_sent" in err_msg:
-                            result["title"] = result["title"] if result["title"] != "Unknown" else "Admin Approval Required"
-                            await asyncio.sleep(1)
-                            try:
-                                chat = await app.get_chat(link)
-                                joined_now = True
-                            except Exception:
-                                pass
-                            break
-                        else:
-                            retry_count += 1
-                            if retry_count == 1:
-                                await asyncio.sleep(2)
-                            elif retry_count == 2:
-                                await asyncio.sleep(random.uniform(2, 5))
-                            else:
-                                raise inner_e
+                try:
+                    chat = await app.join_chat(link)
+                    joined_now = True
+                    await asyncio.sleep(2.5) # REQUIRED DELAY TO SYNC DATA
+                    chat = await app.get_chat(chat.id)
+                except UserAlreadyParticipant:
+                    chat = await app.get_chat(link)
+                except Exception as inner_e:
+                    if "invite_request_sent" in str(inner_e).lower():
+                        result["status"] = "active"
+                        result["title"] = result["title"] if result["title"] != "Unknown" else "Admin Approval Required"
+                        return result, False, 0
+                    else:
+                        raise inner_e
+        else:
+            try:
+                chat = await app.get_chat(ref)
+                if getattr(chat, 'type', None) not in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP, enums.ChatType.CHANNEL]:
+                    raise UsernameInvalid("Not a group or channel")
+            except Exception:
+                try:
+                    chat = await app.join_chat(link)
+                    joined_now = True
+                    await asyncio.sleep(2.5) # REQUIRED DELAY TO SYNC DATA
+                    chat = await app.get_chat(chat.id)
+                except Exception as e:
+                    if "invite_request_sent" in str(e).lower():
+                        result["status"] = "active"
+                        result["title"] = result["title"] if result["title"] != "Unknown" else "Admin Approval Required"
+                        return result, False, 0
+                    raise e
 
+        # STEP 2: EXTRACT EXACT ACCURATE DATA
         result["status"] = "active"
         
         if chat:
@@ -439,53 +431,24 @@ async def try_check_link(app: Client, link: str):
                 except: pass
             if mem_count: result["members"] = str(mem_count)
 
-            # STRICT CHECK: Ensure joining to get exact count if necessary
-            for _ in range(2): 
-                try: 
-                    result["videos"] = str(await app.search_messages_count(chat.id, filter=enums.MessagesFilter.VIDEO))
-                    break
-                except FloodWait as fw:
-                    await asyncio.sleep(fw.value + 1)
-                except Exception: 
-                    if not joined_now:
-                        try:
-                            await app.join_chat(link)
-                            joined_now = True
-                            await asyncio.sleep(2)
-                            chat = await app.get_chat(chat.id)
-                        except UserAlreadyParticipant:
-                            pass 
-                        except Exception:
-                            pass
-                    else:
-                        await asyncio.sleep(0.5)
+            # NEW EXACT FORWARD METHOD
+            is_forward_restricted = getattr(chat, 'has_protected_content', False)
+            result["forward"] = "❌ Off" if is_forward_restricted else "✅ On"
 
-            # STRICT CHECK: Photos Count
-            for _ in range(2):
-                try: 
-                    result["photos"] = str(await app.search_messages_count(chat.id, filter=enums.MessagesFilter.PHOTO))
-                    break
-                except FloodWait as fw:
-                    await asyncio.sleep(fw.value + 1)
-                except Exception: 
-                    pass
-
-            # Initial forward check (Bulletproof Check Added Here)
-            has_protected = bool(getattr(chat, 'has_protected_content', False))
+            # STRICT CHECK: Videos & Photos 
+            try: 
+                v_count = await app.search_messages_count(chat.id, filter=enums.MessagesFilter.VIDEO)
+                result["videos"] = str(v_count)
+            except Exception:
+                result["videos"] = "0"
+                
+            try: 
+                p_count = await app.search_messages_count(chat.id, filter=enums.MessagesFilter.PHOTO)
+                result["photos"] = str(p_count)
+            except Exception:
+                result["photos"] = "0"
             
-            if not has_protected:
-                try:
-                    # Fetching up to 20 latest messages to double-check if the channel actually restricted forwarding.
-                    async for m_test in app.get_chat_history(chat.id, limit=20):
-                        if getattr(m_test, 'has_protected_content', False):
-                            has_protected = True
-                            break
-                except Exception:
-                    pass
-            
-            result["forward"] = "❌ Off" if has_protected else "✅ On"
-            
-            # Chatting and Add Member Check (Refined Permissions Logic)
+            # Chatting and Add Member Check
             if getattr(chat, 'type', None) in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP]:
                 can_txt = True
                 can_med = True
@@ -506,7 +469,7 @@ async def try_check_link(app: Client, link: str):
 
         # Cleanup
         if joined_now and chat:
-            await asyncio.sleep(1)
+            await asyncio.sleep(1.5)
             try: await app.leave_chat(chat.id)
             except: pass
 
