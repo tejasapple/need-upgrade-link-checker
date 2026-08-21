@@ -65,7 +65,7 @@ DEFAULT_CONFIG = {
     "STORAGE_CHANNEL_ID": -1003990522650,
     "ACTIVE_CHANNEL_ID": -1003584008473,
     "EXPIRED_CHANNEL_ID": -1003703360954,
-    "FORWARD_ON_CHANNEL_ID": -1004266075606 ,
+    "FORWARD_ON_CHANNEL_ID": -1004266075606,
     "CHATTING_ON_CHANNEL_ID": -1004290819639,
     "SKIPPED_CHANNEL_ID": -1003703360954,
     "MEMBERS_LESS_1000_ID": -1004367240483,
@@ -344,7 +344,7 @@ async def check_public_via_http(link: str, attempt=1) -> dict:
     return result
 
 # ─────────────────────────────────────────
-#  DEEP LINK CHECKER PRO (COMPLETELY FIXED)
+#  DEEP LINK CHECKER PRO (COMPLETELY FIXED & UPGRADED)
 # ─────────────────────────────────────────
 async def try_check_link(app: Client, link: str):
     is_private, ref = parse_link(link)
@@ -361,56 +361,48 @@ async def try_check_link(app: Client, link: str):
     try:
         # STEP 1: RESOLVE AND FORCE JOIN CHAT
         if is_private:
-            inv = await app.invoke(CheckChatInvite(hash=ref))
-            
-            if hasattr(inv, 'title'): 
-                result["title"] = clean_html_text(inv.title)
-            elif hasattr(inv, 'chat') and hasattr(inv.chat, 'title'):
-                result["title"] = clean_html_text(inv.chat.title)
-                
-            if hasattr(inv, 'participants_count'): 
-                result["members"] = str(inv.participants_count)
-            elif hasattr(inv, 'chat') and hasattr(inv.chat, 'participants_count'):
-                result["members"] = str(inv.chat.participants_count)
+            try:
+                inv = await app.invoke(CheckChatInvite(hash=ref))
+                if hasattr(inv, 'title'): result["title"] = clean_html_text(inv.title)
+                elif hasattr(inv, 'chat') and hasattr(inv.chat, 'title'): result["title"] = clean_html_text(inv.chat.title)
+                if hasattr(inv, 'participants_count'): result["members"] = str(inv.participants_count)
+                elif hasattr(inv, 'chat') and hasattr(inv.chat, 'participants_count'): result["members"] = str(inv.chat.participants_count)
 
-            if isinstance(inv, ChatInviteAlready):
-                try: 
+                if isinstance(inv, ChatInviteAlready):
                     chat = await app.get_chat(inv.chat.id)
-                except Exception: 
-                    try: chat = await app.get_chat(int(f"-100{inv.chat.id}"))
-                    except: pass
-            elif isinstance(inv, ChatInvite):
-                try:
+                elif isinstance(inv, ChatInvite):
                     chat = await app.join_chat(link)
                     joined_now = True
                     await asyncio.sleep(2.5) # REQUIRED DELAY TO SYNC DATA
-                    chat = await app.get_chat(chat.id)
-                except UserAlreadyParticipant:
+            except Exception as e:
+                # Fallback directly joining if CheckChatInvite fails
+                if "already" in str(e).lower():
                     chat = await app.get_chat(link)
-                except Exception as inner_e:
-                    if "invite_request_sent" in str(inner_e).lower():
-                        result["status"] = "active"
-                        result["title"] = result["title"] if result["title"] != "Unknown" else "Admin Approval Required"
-                        return result, False, 0
-                    else:
-                        raise inner_e
+                else:
+                    chat = await app.join_chat(link)
+                    joined_now = True
+                    await asyncio.sleep(2.5)
+            
+            # Make sure we fetch full chat to get precise data
+            if not chat and joined_now:
+                chat = await app.get_chat(link)
+
         else:
             try:
-                chat = await app.get_chat(ref)
-                if getattr(chat, 'type', None) not in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP, enums.ChatType.CHANNEL]:
-                    raise UsernameInvalid("Not a group or channel")
-            except Exception:
-                try:
-                    chat = await app.join_chat(link)
-                    joined_now = True
-                    await asyncio.sleep(2.5) # REQUIRED DELAY TO SYNC DATA
-                    chat = await app.get_chat(chat.id)
-                except Exception as e:
-                    if "invite_request_sent" in str(e).lower():
-                        result["status"] = "active"
-                        result["title"] = result["title"] if result["title"] != "Unknown" else "Admin Approval Required"
-                        return result, False, 0
-                    raise e
+                chat = await app.join_chat(ref)
+                joined_now = True
+                await asyncio.sleep(2.5)
+            except UserAlreadyParticipant:
+                pass
+            except Exception as e:
+                if "invite_request_sent" in str(e).lower():
+                    result["status"] = "active"
+                    result["title"] = result["title"] if result["title"] != "Unknown" else "Admin Approval Required"
+                    return result, False, 0
+
+            chat = await app.get_chat(ref)
+            if getattr(chat, 'type', None) not in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP, enums.ChatType.CHANNEL]:
+                raise UsernameInvalid("Not a group or channel")
 
         # STEP 2: EXTRACT EXACT ACCURATE DATA
         result["status"] = "active"
@@ -431,11 +423,11 @@ async def try_check_link(app: Client, link: str):
                 except: pass
             if mem_count: result["members"] = str(mem_count)
 
-            # NEW EXACT FORWARD METHOD
+            # EXACT FORWARD RESTRICTED METHOD
             is_forward_restricted = getattr(chat, 'has_protected_content', False)
             result["forward"] = "❌ Off" if is_forward_restricted else "✅ On"
 
-            # STRICT CHECK: Videos & Photos 
+            # EXACT CHECK: Videos & Photos 
             try: 
                 v_count = await app.search_messages_count(chat.id, filter=enums.MessagesFilter.VIDEO)
                 result["videos"] = str(v_count)
@@ -448,7 +440,7 @@ async def try_check_link(app: Client, link: str):
             except Exception:
                 result["photos"] = "0"
             
-            # Chatting and Add Member Check
+            # EXACT CHATTING AND ADD MEMBER CHECK
             if getattr(chat, 'type', None) in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP]:
                 can_txt = True
                 can_med = True
@@ -483,14 +475,16 @@ async def try_check_link(app: Client, link: str):
         result["title"] = "Banned / Terms of Service"
         return result, False, 0
     except (PeerIdInvalid, ChannelPrivate):
-        return None, True, 0
+        result["status"] = "expired"
+        result["title"] = "Inaccessible / Private"
+        return result, False, 0
     except (InviteHashExpired, InviteHashInvalid, UsernameInvalid, UsernameNotOccupied):
         result["status"] = "expired"
         result["title"] = "Expired / Invalid"
         return result, False, 0
     except Exception as e:
         err_msg = str(e).lower()
-        if "expire" in err_msg or "invalid" in err_msg or "not_occupied" in err_msg or "not a group" in err_msg or "banned" in err_msg or "violated" in err_msg or "restricted" in err_msg:
+        if any(x in err_msg for x in ["expire", "invalid", "not_occupied", "not a group", "banned", "violated", "restricted"]):
             result["status"] = "expired"
             result["title"] = "Expired / Invalid"
             return result, False, 0
@@ -1020,7 +1014,7 @@ async def _update_dashboard_if_needed(uid: int, force=False):
     except: pass
 
 # ─────────────────────────────────────────
-#  BULK RUNNER WITH QUEUE 
+#  BULK RUNNER WITH QUEUE (WITH ANTI-FALSE-SKIP LOGIC)
 # ─────────────────────────────────────────
 async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False):
     QUEUE_CONTROL[uid] = "running"
@@ -1183,6 +1177,20 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False
                     continue 
                     
                 final_result = res if res else {"link": lnk, "status": "skipped", "title": "Unknown Error"}
+                
+                # 🚀 CORE FIX FOR FALSE SKIPS/EXPIRES:
+                # Agar deep check (account wala) fail ho gaya par normal HTTP ne usko Active bataya tha:
+                if final_result["status"] in ["expired", "skipped", "error"] and http_res.get("status") == "active":
+                    final_result["status"] = "active"
+                    final_result["title"] = http_res.get("title", final_result.get("title", "Active Link"))
+                    
+                    if final_result.get("members", "N/A") == "N/A":
+                        final_result["members"] = http_res.get("members", "N/A")
+                    
+                    if final_result.get("videos") in ["0", "N/A"]: final_result["videos"] = "Hidden"
+                    if final_result.get("photos") in ["0", "N/A"]: final_result["photos"] = "Hidden"
+                    if final_result.get("forward") == "N/A": final_result["forward"] = "Unknown"
+
                 if final_result["status"] == "active":
                     c_data["checks"] += 1
             
