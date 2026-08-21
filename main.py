@@ -266,47 +266,78 @@ def parse_msg_link(link: str):
     return None, None
 
 # ─────────────────────────────────────────
-#  HTTP LINK CHECKER (NEW AIOHTTP METHOD)
+#  HTTP LINK CHECKER (FIXED & ULTRA-STRICT METHOD)
 # ─────────────────────────────────────────
 async def check_public_via_http(link: str, attempt=1) -> dict:
     is_private, _ = parse_link(link)
     result = {"link": link, "status": "unknown", "title": "Unknown", "members": "N/A"}
     try:
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9"
+        }
         async with aiohttp.ClientSession() as sess:
             async with sess.get(link, headers=headers, timeout=10, allow_redirects=True) as r:
+                if r.status in [404, 400]:
+                    result["status"] = "expired"; result["title"] = "Expired / Not Found"
+                    return result
                 if r.status == 429:
                     result["status"] = "error"; result["title"] = "Rate Limited"
                     return result
                 html_text = await r.text(errors="replace")
 
+        lower_text = html_text.lower()
+        
+        # 1. BANNED / EXPIRED SIGNATURES (Broad check for dead links)
+        dead_phrases = [
+            "invite link is invalid", "link is invalid", "has expired", 
+            "no longer valid", "not valid", "invalid invite",
+            "not found", "user does not exist", "doesn't exist",
+            "tgme_page_icon_error", "violated", "copyright", 
+            "cannot be displayed", "banned", "inaccessible", 
+            "pornographic", "terms of service", "this channel is unavailable"
+        ]
+        
+        if any(phrase in lower_text for phrase in dead_phrases):
+            result["status"] = "expired"; result["title"] = "Expired / Invalid"
+            return result
+        
+        # 2. Extract meta title to verify if it's just a default Telegram page
+        m_title = re.search(r'<meta property="og:title"\s+content="([^"]+)"', html_text)
+        title = m_title.group(1).strip() if m_title else ""
+        
+        # If title is generic, the link didn't resolve to a real chat/group and redirected
+        generic_titles = {"telegram", "telegram messenger", "join group chat on telegram", "join channel on telegram"}
+        
+        if not title or title.lower() in generic_titles:
+            result["status"] = "expired"; result["title"] = "Expired / Invalid"
+            return result
+
+        # 3. IF IT PASSED THE ABOVE, CHECK FOR ACTIVE BUTTONS/CONTENT
         if is_private:
-            if any(sig in html_text.lower() for sig in ["has expired", "no longer valid", "not valid", "invalid invite"]) or not bool(re.search(r'tgme_action_button|btn_join|"Join\s+(Group|Channel|Chat)"', html_text, re.I)):
+            # Additional strict check for private links
+            if not bool(re.search(r'tgme_action_button|btn_join|"Join\s+(Group|Channel|Chat)"', html_text, re.I)):
                 result["status"] = "expired"; result["title"] = "Expired Link"
             else:
                 result["status"] = "active"
+                result["title"] = title if title else "Private Chat"
         else:
-            m_title = re.search(r'<meta property="og:title"\s+content="([^"]+)"', html_text)
-            m_desc  = re.search(r'<meta property="og:description"\s+content="([^"]+)"', html_text)
-            title = m_title.group(1).strip() if m_title else ""
-            desc  = m_desc.group(1).strip()  if m_desc  else ""
-
-            if not title or title.lower() in {"telegram", "telegram messenger", "join group chat on telegram", "join channel on telegram"}:
-                result["status"] = "expired"; result["title"] = "Expired / Invalid"
-            else:
-                mc = re.search(r'class="tgme_page_extra"[^>]*>\s*([\d\s,.\xa0KMB]+)\s*(?:members?|subscribers?)', html_text, re.I)
-                if not mc: mc = re.search(r"([\d\s,.\xa0KMB]+)\s*(?:members?|subscribers?)", desc, re.I)
-                
-                result["status"] = "active"
-                result["title"] = title
-                if mc: result["members"] = mc.group(1).replace('\xa0', ' ').strip()
-                else: result["members"] = "N/A"
+            m_desc = re.search(r'<meta property="og:description"\s+content="([^"]+)"', html_text)
+            desc = m_desc.group(1).strip() if m_desc else ""
             
+            mc = re.search(r'class="tgme_page_extra"[^>]*>\s*([\d\s,.\xa0KMB]+)\s*(?:members?|subscribers?)', html_text, re.I)
+            if not mc: mc = re.search(r"([\d\s,.\xa0KMB]+)\s*(?:members?|subscribers?)", desc, re.I)
+            
+            result["status"] = "active"
+            result["title"] = title
+            if mc: result["members"] = mc.group(1).replace('\xa0', ' ').strip()
+            else: result["members"] = "N/A"
+        
     except Exception as e:
         result["status"] = "error"; result["title"] = str(e)[:60]
         
-    # Double Check Logic
-    if result["status"] in ["expired", "error"] and attempt == 1:
+    # Double Check Logic for network errors
+    if result["status"] in ["error", "unknown"] and attempt == 1:
         await asyncio.sleep(2.0) 
         return await check_public_via_http(link, attempt=2)
         
