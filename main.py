@@ -228,7 +228,6 @@ def extract_links(text: str) -> list:
     for lnk in raw:
         lnk = lnk.rstrip("-.,_ \n\t*`~")
         if not lnk.startswith("http"): lnk = "https://" + lnk
-        # Removed GLOBAL_SEEN_LINKS check to allow full re-scraping
         if lnk not in seen and "t.me/" in lnk:
             seen.add(lnk)
             out.append(lnk)
@@ -266,79 +265,52 @@ def parse_msg_link(link: str):
         pass
     return None, None
 
-async def fast_http_link_check(link: str) -> str:
-    link = link.strip().rstrip("-.,_ \n\t*`~")
-    
-    # Do baar check karo (Retry mechanism for accuracy 3 times)
-    for _ in range(3): 
-        try:
-            async with aiohttp.ClientSession() as s:
-                headers = {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Cache-Control": "no-cache"
-                }
-                async with s.get(link, timeout=5, headers=headers, allow_redirects=True) as resp:
-                    if resp.status == 200:
-                        text = await resp.text()
-                        lower_text = text.lower()
-                        
-                        # 1. BANNED / VIOLATED CHECK (Treat as Expired)
-                        banned_phrases = [
-                            "violated",
-                            "copyright",
-                            "cannot be displayed",
-                            "banned",
-                            "inaccessible",
-                            "pornographic",
-                            "terms of service",
-                            "this channel is unavailable"
-                        ]
-                        if any(phrase in lower_text for phrase in banned_phrases):
-                            return "expired"
-                            
-                        # 2. EXPIRED / INVALID CHECK
-                        expired_phrases = [
-                            "invite link is invalid", 
-                            "link is invalid", 
-                            "has expired",
-                            "tgme_page_icon_error",
-                            "not found",
-                            "user does not exist",
-                            "no longer valid",
-                            "doesn't exist"
-                        ]
-                        if any(phrase in lower_text for phrase in expired_phrases):
-                            return "expired"
-                            
-                        # 3. STRICT ACTIVE CHECK (Expanded indicators)
-                        active_indicators = [
-                            'tgme_action_button', 
-                            'tgme_page_button', 
-                            'Join Channel', 
-                            'Join Group', 
-                            'View in Telegram', 
-                            'View Channel', 
-                            'Send Message'
-                        ]
-                        if any(indicator in text for indicator in active_indicators):
-                            return "active"
-                            
-                        # 4. Fallback: if page loaded properly but has no active indicators -> Expired
-                        if 'tgme_page_wrap' in lower_text or 'tgme_page_title' in lower_text:
-                            return "expired"
-                            
-                    elif resp.status == 404:
-                        return "expired" 
-                    elif resp.status == 429:
-                        await asyncio.sleep(1)
-                        continue
-                        
-        except Exception:
-            await asyncio.sleep(1)
+# ─────────────────────────────────────────
+#  HTTP LINK CHECKER (NEW AIOHTTP METHOD)
+# ─────────────────────────────────────────
+async def check_public_via_http(link: str, attempt=1) -> dict:
+    is_private, _ = parse_link(link)
+    result = {"link": link, "status": "unknown", "title": "Unknown", "members": "N/A"}
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get(link, headers=headers, timeout=10, allow_redirects=True) as r:
+                if r.status == 429:
+                    result["status"] = "error"; result["title"] = "Rate Limited"
+                    return result
+                html_text = await r.text(errors="replace")
+
+        if is_private:
+            if any(sig in html_text.lower() for sig in ["has expired", "no longer valid", "not valid", "invalid invite"]) or not bool(re.search(r'tgme_action_button|btn_join|"Join\s+(Group|Channel|Chat)"', html_text, re.I)):
+                result["status"] = "expired"; result["title"] = "Expired Link"
+            else:
+                result["status"] = "active"
+        else:
+            m_title = re.search(r'<meta property="og:title"\s+content="([^"]+)"', html_text)
+            m_desc  = re.search(r'<meta property="og:description"\s+content="([^"]+)"', html_text)
+            title = m_title.group(1).strip() if m_title else ""
+            desc  = m_desc.group(1).strip()  if m_desc  else ""
+
+            if not title or title.lower() in {"telegram", "telegram messenger", "join group chat on telegram", "join channel on telegram"}:
+                result["status"] = "expired"; result["title"] = "Expired / Invalid"
+            else:
+                mc = re.search(r'class="tgme_page_extra"[^>]*>\s*([\d\s,.\xa0KMB]+)\s*(?:members?|subscribers?)', html_text, re.I)
+                if not mc: mc = re.search(r"([\d\s,.\xa0KMB]+)\s*(?:members?|subscribers?)", desc, re.I)
+                
+                result["status"] = "active"
+                result["title"] = title
+                if mc: result["members"] = mc.group(1).replace('\xa0', ' ').strip()
+                else: result["members"] = "N/A"
             
-    # Default to unknown only if network completely blocks all 3 attempts
-    return "unknown"
+    except Exception as e:
+        result["status"] = "error"; result["title"] = str(e)[:60]
+        
+    # Double Check Logic
+    if result["status"] in ["expired", "error"] and attempt == 1:
+        await asyncio.sleep(2.0) 
+        return await check_public_via_http(link, attempt=2)
+        
+    return result
 
 async def try_check_link(app: Client, link: str):
     is_private, ref = parse_link(link)
@@ -358,7 +330,6 @@ async def try_check_link(app: Client, link: str):
             if getattr(chat, 'type', None) not in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP, enums.ChatType.CHANNEL]:
                 raise UsernameInvalid("Not a group or channel")
         else:
-            # Fixing the Unknown & N/A issue by grabbing Raw Data before joining
             inv = await app.invoke(CheckChatInvite(hash=ref))
             
             if hasattr(inv, 'title'): 
@@ -399,7 +370,7 @@ async def try_check_link(app: Client, link: str):
                                 chat = await app.get_chat(link)
                                 joined_now = True
                             except Exception:
-                                pass # We already got title and members from raw inv!
+                                pass
                             break
                         else:
                             retry_count += 1
@@ -801,7 +772,6 @@ async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True):
             return
             
         total_extracted = 0
-        # Cleared memory dynamically to allow scraping of ALL links requested by user
         if uid not in SCRAPER_DUPLICATES: SCRAPER_DUPLICATES[uid] = set()
         SCRAPER_DUPLICATES[uid].clear() 
 
@@ -1135,11 +1105,11 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False
                 current_pinned_msg_id = msg_id
 
             fast_checked_expired = False
-            http_res = await fast_http_link_check(lnk)
+            http_res = await check_public_via_http(lnk)
             
-            if http_res == "expired":
+            if http_res.get("status") in ["expired", "error"]:
                 final_result = {
-                    "link": lnk, "status": "expired", "title": "Expired / Invalid",
+                    "link": lnk, "status": "expired", "title": http_res.get("title", "Expired / Invalid"),
                     "username": "N/A", "members": "N/A", "videos": "N/A", "photos": "N/A",
                     "forward": "N/A", "chatting": "❌ Off", "add_member": "❌ Off", "media_only": False
                 }
@@ -1567,10 +1537,11 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         unknown_links = []
         
         for l in links:
-            status = await fast_http_link_check(l)
+            res = await check_public_via_http(l)
+            status = res.get("status")
             if status == "active":
                 active_links.append(l)
-            elif status == "expired":
+            elif status in ["expired", "error"]:
                 expired_links.append(l)
             else:
                 unknown_links.append(l)
@@ -1778,7 +1749,6 @@ async def start_background_tasks(application: Application):
     except Exception as e:
         print(f"[{datetime.now()}] ❌ Failed to start Global Pyrogram Bot: {e}")
 
-    # load_seen_links() - Removed entirely as duplicate memory is no longer required globally.
     asyncio.create_task(auto_scraper_loop())
     print(f"[{datetime.now()}] 🟢 Background Auto-Scraper Task Started Successfully!")
 
