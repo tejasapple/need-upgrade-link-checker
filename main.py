@@ -364,9 +364,16 @@ async def try_check_link(app: Client, link: str):
 
     try:
         if not is_private:
-            chat = await app.get_chat(ref)
-            if getattr(chat, 'type', None) not in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP, enums.ChatType.CHANNEL]:
-                raise UsernameInvalid("Not a group or channel")
+            try:
+                chat = await app.get_chat(ref)
+                if getattr(chat, 'type', None) not in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP, enums.ChatType.CHANNEL]:
+                    raise UsernameInvalid("Not a group or channel")
+            except Exception:
+                # Fallback: Join chat to get properties if get_chat fails
+                chat = await app.join_chat(link)
+                joined_now = True
+                await asyncio.sleep(2)
+                chat = await app.get_chat(chat.id)
         else:
             inv = await app.invoke(CheckChatInvite(hash=ref))
             
@@ -422,9 +429,6 @@ async def try_check_link(app: Client, link: str):
         result["status"] = "active"
         
         if chat:
-            # ─────────────────────────────────────────
-            # FIX: STRICT CHECK FOR BANNED/RESTRICTED CHATS
-            # ─────────────────────────────────────────
             if getattr(chat, 'is_restricted', False):
                 result["status"] = "expired"
                 result["title"] = "Banned / Terms of Service"
@@ -440,7 +444,8 @@ async def try_check_link(app: Client, link: str):
                 except: pass
             if mem_count: result["members"] = str(mem_count)
             
-            has_protected = getattr(chat, 'has_protected_content', False)
+            # Initial forward check
+            has_protected = bool(getattr(chat, 'has_protected_content', False))
             result["forward"] = "❌ Off" if has_protected else "✅ On"
             
             if getattr(chat, 'type', None) in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP]:
@@ -464,24 +469,44 @@ async def try_check_link(app: Client, link: str):
             if joined_now:
                 await asyncio.sleep(2) 
                 
+            # STRICT CHECK: Videos Count and Correct Forward Status
             for _ in range(2): 
                 try: 
                     result["videos"] = str(await app.search_messages_count(chat.id, filter=enums.MessagesFilter.VIDEO))
                     break
                 except FloodWait as fw:
                     await asyncio.sleep(fw.value + 1)
-                except: 
-                    await asyncio.sleep(0.5)
+                except Exception as e: 
+                    # If fetching fails (usually because of ChatAdminRequired), we MUST join to extract accurately.
+                    if not joined_now:
+                        try:
+                            await app.join_chat(link)
+                            joined_now = True
+                            await asyncio.sleep(2)
+                            
+                            # Re-fetch chat object to ensure has_protected_content is updated accurately
+                            chat = await app.get_chat(chat.id)
+                            has_protected = bool(getattr(chat, 'has_protected_content', False))
+                            result["forward"] = "❌ Off" if has_protected else "✅ On"
+                            
+                            result["videos"] = str(await app.search_messages_count(chat.id, filter=enums.MessagesFilter.VIDEO))
+                            break
+                        except Exception:
+                            await asyncio.sleep(0.5)
+                    else:
+                        await asyncio.sleep(0.5)
                     
+            # STRICT CHECK: Photos Count
             for _ in range(2):
                 try: 
                     result["photos"] = str(await app.search_messages_count(chat.id, filter=enums.MessagesFilter.PHOTO))
                     break
                 except FloodWait as fw:
                     await asyncio.sleep(fw.value + 1)
-                except: 
-                    await asyncio.sleep(0.5)
+                except Exception: 
+                    pass
 
+        # Cleanup
         if joined_now and chat:
             await asyncio.sleep(1)
             try: await app.leave_chat(chat.id)
@@ -492,9 +517,6 @@ async def try_check_link(app: Client, link: str):
     except FloodWait as e:
         wait_time = getattr(e, 'value', 30)
         return None, True, wait_time
-    # ─────────────────────────────────────────
-    # FIX: DIRECTLY ROUTE BANNED ERRORS TO EXPIRED
-    # ─────────────────────────────────────────
     except ChannelBanned:
         result["status"] = "expired"
         result["title"] = "Banned / Terms of Service"
@@ -507,7 +529,6 @@ async def try_check_link(app: Client, link: str):
         return result, False, 0
     except Exception as e:
         err_msg = str(e).lower()
-        # FIX: ADDED BAN KEYWORDS TO CATCH ALL VIOLATION EXCEPTIONS
         if "expire" in err_msg or "invalid" in err_msg or "not_occupied" in err_msg or "not a group" in err_msg or "banned" in err_msg or "violated" in err_msg or "restricted" in err_msg:
             result["status"] = "expired"
             result["title"] = "Expired / Invalid"
@@ -827,8 +848,8 @@ async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True):
             
         total_extracted = 0
         if uid not in SCRAPER_DUPLICATES: SCRAPER_DUPLICATES[uid] = set()
-        SCRAPER_DUPLICATES[uid].clear() 
-
+        # SCRAPER_DUPLICATES is NOT cleared automatically unless Force Target is used
+        
         if manual:
             prog_resp = await _send_raw(cid, f"🔄 <b>Starting Deep Scrape from {len(targets)} Targets...</b>\n<i>(Extracting links, tracking progress)</i>")
             prog_msg_id = prog_resp.get("result", {}).get("message_id") if isinstance(prog_resp, dict) else None
@@ -1101,9 +1122,6 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False
                     fetched_msg = None
                     messages_received = 0
                     try:
-                        # FIX: Using PYRO_BOT instead of c_app (Checker IDs). 
-                        # Checker IDs might not be in the Storage Channel and cause silent ChannelPrivate errors.
-                        # PYRO_BOT is the bot itself, which has Admin access to the Storage channel.
                         msg_ids_to_fetch = list(range(storage_last_msg_id, storage_last_msg_id + 50))
                         messages = await PYRO_BOT.get_messages(get_conf("STORAGE_CHANNEL_ID"), msg_ids_to_fetch)
                         
@@ -1135,12 +1153,12 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False
                             
                     except Exception as e:
                         logger.error(f"Storage Queue Error: {e}")
-                        empty_storage_batches += 1 # FIX: Ensure we don't get stuck in an infinite loop
+                        empty_storage_batches += 1
                         pass
                     
                     if not USER_QUEUES.get(uid):
                         await _update_dashboard_if_needed(uid, force=True)
-                        if empty_storage_batches > 40: # FIX: Increased limit to handle larger message gaps
+                        if empty_storage_batches > 40: 
                             await _send_raw(cid, "✅ <b>Storage Checking Paused/Finished.</b>\nReached the end of available messages in Storage. Will re-check soon if resumed.")
                             break
                         
@@ -1280,6 +1298,7 @@ def PRO_KB(uid):
         [{"text": f"🏦 Checker Bank ({len(checker_sessions)} Active)", "callback_data": "menu_accounts"}],
         [{"text": f"🕷️ Scraper Accounts & Targets ({len(scraper_sessions)} Active)", "callback_data": "menu_scraper"}],
         [{"text": "📥 Trigger Smart Scrape Now", "callback_data": "scraper_today"}],
+        [{"text": "🚀 Force Start Storage (Ignore History)", "callback_data": "force_storage"}],
         [{"text": "🔗 Check Links (Manual Mode)", "callback_data": "menu_check"}],
         [{"text": "⚙️ Checker Settings (Delay)", "callback_data": "menu_settings"}],
         [{"text": "⚙️ Channel Configurations", "callback_data": "menu_config_checker"}],
@@ -1396,6 +1415,22 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data["mode"] = "setting_delay"
         await _edit_raw(cid, mid, "⏱️ <b>Send your custom delay in seconds.</b>\n\nExample: `5 10` (for a random delay between 5 to 10 seconds)", [[{"text": "🔙 Cancel", "callback_data": "menu_settings"}]])
 
+    elif d == "force_storage":
+        if CHECKING_LOCKS.get(uid):
+            await _edit_raw(cid, mid, "⚠️ <b>Queue is already running!</b>", [[{"text": "🔙 Back", "callback_data": "menu_pro"}]])
+            return
+            
+        sessions = get_user_sessions(uid, "checker")
+        if not sessions:
+            await _edit_raw(cid, mid, "❌ <b>No Checker Accounts logged in!</b>", [[{"text": "🔙 Back", "callback_data": "menu_pro"}]])
+            return
+            
+        if uid in CHECKER_DUPLICATES: CHECKER_DUPLICATES[uid].clear()
+        
+        CHECKING_LOCKS[uid] = True
+        asyncio.create_task(_run_bulk_check(uid, cid, sessions, auto_storage=True))
+        await _edit_raw(cid, mid, "✅ <b>Forced Storage Checking Started!</b>\nAll valid links in the storage channel will be extracted and re-verified.", [[{"text": "🔙 Back", "callback_data": "menu_pro"}]])
+
     elif d == "menu_scraper":
         state = load_scraper_state(uid)
         scraper_sessions = get_user_sessions(uid, "scraper")
@@ -1411,6 +1446,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             
         kb.extend([
             [{"text": "🎯 Add Target", "callback_data": "scraper_add_target"}, {"text": "🗑 Remove Target", "callback_data": "scraper_rem_target"}],
+            [{"text": "🚀 Force Start Target ID", "callback_data": "force_target_scraper"}],
             [{"text": f"🔄 12-Hour Auto: {auto_stat}", "callback_data": "scraper_tog_auto"}],
             [{"text": "🔙 Back", "callback_data": "menu_pro"}]
         ])
@@ -1445,6 +1481,10 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif d == "scraper_add_target":
         ctx.user_data["mode"] = "scraper_target"
         await _edit_raw(cid, mid, "🎯 <b>Add New Scraper Target</b>\n\nYou can:\n1. Forward any message from the Group/Channel here.\n2. Send the Chat ID (e.g. `-10012345678`)\n3. Paste a Message Link (e.g. `t.me/c/12345/67` or `t.me/joinchat/...`)\n\n<i>(अगर आप पहले से एडेड टारगेट को दोबारा भेजते हैं, तो वह टारगेट रिसेट हो जाएगा और शुरू से सारे लिंक दोबारा स्क्रैप करेगा)</i>", [[{"text": "🔙 Cancel", "callback_data": "menu_scraper"}]])
+
+    elif d == "force_target_scraper":
+        ctx.user_data["mode"] = "force_target_wait"
+        await _edit_raw(cid, mid, "🚀 <b>Force Start Target ID</b>\n\nSend the Target ID (Chat ID, Link, or Forward a message). Bot will instantly start scraping from it, ignoring any previous duplicate history.\n\n<i>(Send /cancel to abort)</i>", [[{"text": "🔙 Cancel", "callback_data": "menu_scraper"}]])
 
     elif d == "scraper_rem_target":
         state = load_scraper_state(uid)
@@ -1631,7 +1671,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         for chunk in all_chunks[1:]:
             await update.message.reply_text(chunk, disable_web_page_preview=True, parse_mode="HTML")
 
-    elif mode == "scraper_target":
+    elif mode in ["scraper_target", "force_target_wait"]:
         state = load_scraper_state(uid)
         target_val = None
         msg_id_to_save = 0
@@ -1659,8 +1699,18 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             targets[target_val] = msg_id_to_save
             state["targets"] = targets
             save_scraper_state(uid, state)
-            await update.message.reply_text(f"✅ <b>Target Successfully Added/Updated:</b> <code>{target_val}</code>\n<i>Bot will start scraping from message ID {msg_id_to_save} onwards. It will extract and process ALL links found as per settings.</i>", parse_mode="HTML")
-            ctx.user_data["mode"] = ""
+            
+            if mode == "force_target_wait":
+                if uid in SCRAPER_DUPLICATES: SCRAPER_DUPLICATES[uid].clear()
+                if uid in CHECKER_DUPLICATES: CHECKER_DUPLICATES[uid].clear()
+                await update.message.reply_text(f"✅ <b>Target Set! Force Starting Scraper...</b>\nTarget: <code>{target_val}</code>", parse_mode="HTML")
+                ctx.user_data["mode"] = ""
+                if SCRAPER_TASKS.get(uid) != "running":
+                    SCRAPER_TASKS[uid] = "running"
+                    asyncio.create_task(_run_daily_scraper_task(uid, cid, state, manual=True))
+            else:
+                await update.message.reply_text(f"✅ <b>Target Successfully Added/Updated:</b> <code>{target_val}</code>\n<i>Bot will start scraping from message ID {msg_id_to_save} onwards. It will extract and process ALL links found as per settings.</i>", parse_mode="HTML")
+                ctx.user_data["mode"] = ""
         else:
             await update.message.reply_text("❌ <b>Invalid input.</b>\nPlease send a valid Chat ID, Username, or Message Link.")
 
