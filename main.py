@@ -21,8 +21,10 @@ from pyrogram.errors import (
     ChannelBanned, PeerIdInvalid, BadRequest, ChatAdminRequired,
     InviteHashExpired, InviteHashInvalid, AuthKeyUnregistered 
 )
-from pyrogram.raw.functions.messages import CheckChatInvite
-from pyrogram.raw.types import ChatInviteAlready, ChatInvite
+# --- NEW RAW API IMPORTS ADDED HERE ---
+from pyrogram.raw.functions.messages import CheckChatInvite, GetFullChat, GetSearchCounters
+from pyrogram.raw.functions.channels import GetFullChannel
+from pyrogram.raw.types import ChatInviteAlready, ChatInvite, InputMessagesFilterVideo, InputMessagesFilterPhoto
 
 # ─────────────────────────────────────────
 #  CONFIG & INITIALIZATION
@@ -423,22 +425,66 @@ async def try_check_link(app: Client, link: str):
                 except: pass
             if mem_count: result["members"] = str(mem_count)
 
-            # EXACT FORWARD RESTRICTED METHOD
-            is_forward_restricted = getattr(chat, 'has_protected_content', False)
-            result["forward"] = "❌ Off" if is_forward_restricted else "✅ On"
-
-            # EXACT CHECK: Videos & Photos 
-            try: 
-                v_count = await app.search_messages_count(chat.id, filter=enums.MessagesFilter.VIDEO)
-                result["videos"] = str(v_count)
-            except Exception:
-                result["videos"] = "0"
+            # ==========================================
+            # 100% ACCURATE FORWARD RESTRICTED CHECK (RAW API)
+            # ==========================================
+            try:
+                peer = await app.resolve_peer(chat.id)
+                is_forward_restricted = False
                 
+                if chat.type in [enums.ChatType.CHANNEL, enums.ChatType.SUPERGROUP]:
+                    full_chat_req = await app.invoke(GetFullChannel(channel=peer))
+                    for c in full_chat_req.chats:
+                        if c.id == peer.channel_id:
+                            is_forward_restricted = getattr(c, 'noforwards', False)
+                            break
+                else:
+                    full_chat_req = await app.invoke(GetFullChat(chat_id=peer.chat_id))
+                    for c in full_chat_req.chats:
+                        if c.id == peer.chat_id:
+                            is_forward_restricted = getattr(c, 'noforwards', False)
+                            break
+
+                result["forward"] = "❌ Off" if is_forward_restricted else "✅ On"
+            except Exception as e:
+                logger.error(f"Raw API Forward Check Error: {e}")
+                is_forward_restricted = getattr(chat, 'has_protected_content', False)
+                result["forward"] = "❌ Off" if is_forward_restricted else "✅ On"
+
+            # ==========================================
+            # 100% EXACT CHECK: Videos & Photos (RAW API)
+            # ==========================================
             try: 
-                p_count = await app.search_messages_count(chat.id, filter=enums.MessagesFilter.PHOTO)
+                peer = await app.resolve_peer(chat.id)
+                counters = await app.invoke(
+                    GetSearchCounters(
+                        peer=peer,
+                        filters=[InputMessagesFilterVideo(), InputMessagesFilterPhoto()]
+                    )
+                )
+                v_count = 0
+                p_count = 0
+                for counter in counters:
+                    if isinstance(counter.filter, InputMessagesFilterVideo):
+                        v_count = counter.count
+                    elif isinstance(counter.filter, InputMessagesFilterPhoto):
+                        p_count = counter.count
+                
+                result["videos"] = str(v_count)
                 result["photos"] = str(p_count)
-            except Exception:
-                result["photos"] = "0"
+            except Exception as e:
+                logger.error(f"Raw API Media Count Error: {e}")
+                try: 
+                    v_count = await app.search_messages_count(chat.id, filter=enums.MessagesFilter.VIDEO)
+                    result["videos"] = str(v_count)
+                except Exception:
+                    result["videos"] = "0"
+                    
+                try: 
+                    p_count = await app.search_messages_count(chat.id, filter=enums.MessagesFilter.PHOTO)
+                    result["photos"] = str(p_count)
+                except Exception:
+                    result["photos"] = "0"
             
             # EXACT CHATTING AND ADD MEMBER CHECK
             if getattr(chat, 'type', None) in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP]:
@@ -1179,7 +1225,6 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False
                 final_result = res if res else {"link": lnk, "status": "skipped", "title": "Unknown Error"}
                 
                 # 🚀 CORE FIX FOR FALSE SKIPS/EXPIRES:
-                # Agar deep check (account wala) fail ho gaya par normal HTTP ne usko Active bataya tha:
                 if final_result["status"] in ["expired", "skipped", "error"] and http_res.get("status") == "active":
                     final_result["status"] = "active"
                     final_result["title"] = http_res.get("title", final_result.get("title", "Active Link"))
