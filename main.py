@@ -415,6 +415,14 @@ async def try_check_link(app: Client, link: str):
         result["status"] = "active"
         
         if chat:
+            # ─────────────────────────────────────────
+            # FIX: STRICT CHECK FOR BANNED/RESTRICTED CHATS
+            # ─────────────────────────────────────────
+            if getattr(chat, 'is_restricted', False):
+                result["status"] = "expired"
+                result["title"] = "Banned / Terms of Service"
+                return result, False, 0
+                
             raw_title = getattr(chat, 'title', None) or getattr(chat, 'first_name', None)
             if raw_title:
                 result["title"] = clean_html_text(raw_title)
@@ -477,7 +485,14 @@ async def try_check_link(app: Client, link: str):
     except FloodWait as e:
         wait_time = getattr(e, 'value', 30)
         return None, True, wait_time
-    except (ChannelBanned, PeerIdInvalid, ChannelPrivate):
+    # ─────────────────────────────────────────
+    # FIX: DIRECTLY ROUTE BANNED ERRORS TO EXPIRED
+    # ─────────────────────────────────────────
+    except ChannelBanned:
+        result["status"] = "expired"
+        result["title"] = "Banned / Terms of Service"
+        return result, False, 0
+    except (PeerIdInvalid, ChannelPrivate):
         return None, True, 0
     except (InviteHashExpired, InviteHashInvalid, UsernameInvalid, UsernameNotOccupied):
         result["status"] = "expired"
@@ -485,7 +500,8 @@ async def try_check_link(app: Client, link: str):
         return result, False, 0
     except Exception as e:
         err_msg = str(e).lower()
-        if "expire" in err_msg or "invalid" in err_msg or "not_occupied" in err_msg or "not a group" in err_msg:
+        # FIX: ADDED BAN KEYWORDS TO CATCH ALL VIOLATION EXCEPTIONS
+        if "expire" in err_msg or "invalid" in err_msg or "not_occupied" in err_msg or "not a group" in err_msg or "banned" in err_msg or "violated" in err_msg or "restricted" in err_msg:
             result["status"] = "expired"
             result["title"] = "Expired / Invalid"
             return result, False, 0
@@ -1629,7 +1645,6 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             
         if target_val:
             targets = state.get("targets", {})
-            # Overwriting the target if exists resets progress and forces rescrape!
             targets[target_val] = msg_id_to_save
             state["targets"] = targets
             save_scraper_state(uid, state)
