@@ -309,7 +309,6 @@ async def check_public_via_http(link: str, attempt=1) -> dict:
         
         generic_titles = {"telegram", "telegram messenger", "join group chat on telegram", "join channel on telegram"}
         
-        # Check if title is generic OR starts with "Telegram: Contact" (which happens for banned/dead public links)
         if not title or title.lower() in generic_titles or title.lower().startswith("telegram: contact"):
             result["status"] = "expired"; result["title"] = "Expired / Invalid"
             return result
@@ -318,7 +317,6 @@ async def check_public_via_http(link: str, attempt=1) -> dict:
         has_action_btn = bool(re.search(r'tgme_action_button|btn_join|"Join\s+(Group|Channel|Chat)"', html_text, re.I))
 
         if is_private:
-            # Additional strict check for private links
             if not has_action_btn:
                 result["status"] = "expired"; result["title"] = "Expired Link"
             else:
@@ -326,7 +324,6 @@ async def check_public_via_http(link: str, attempt=1) -> dict:
                 result["title"] = title if title else "Private Chat"
         else:
             if not has_action_btn:
-                # Banned/Dead public links lose their action buttons
                 result["status"] = "expired"; result["title"] = "Expired / Banned"
             else:
                 m_desc = re.search(r'<meta property="og:description"\s+content="([^"]+)"', html_text)
@@ -343,7 +340,6 @@ async def check_public_via_http(link: str, attempt=1) -> dict:
     except Exception as e:
         result["status"] = "error"; result["title"] = str(e)[:60]
         
-    # Double Check Logic for network errors
     if result["status"] in ["error", "unknown"] and attempt == 1:
         await asyncio.sleep(2.0) 
         return await check_public_via_http(link, attempt=2)
@@ -369,7 +365,6 @@ async def try_check_link(app: Client, link: str):
                 if getattr(chat, 'type', None) not in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP, enums.ChatType.CHANNEL]:
                     raise UsernameInvalid("Not a group or channel")
             except Exception:
-                # Fallback: Join chat to get properties if get_chat fails
                 chat = await app.join_chat(link)
                 joined_now = True
                 await asyncio.sleep(2)
@@ -443,19 +438,49 @@ async def try_check_link(app: Client, link: str):
                 try: mem_count = await app.get_chat_members_count(chat.id)
                 except: pass
             if mem_count: result["members"] = str(mem_count)
-            
+
+            # STRICT CHECK: Ensure joining to get exact count if necessary
+            for _ in range(2): 
+                try: 
+                    result["videos"] = str(await app.search_messages_count(chat.id, filter=enums.MessagesFilter.VIDEO))
+                    break
+                except FloodWait as fw:
+                    await asyncio.sleep(fw.value + 1)
+                except Exception: 
+                    if not joined_now:
+                        try:
+                            await app.join_chat(link)
+                            joined_now = True
+                            await asyncio.sleep(2)
+                            chat = await app.get_chat(chat.id)
+                        except UserAlreadyParticipant:
+                            pass 
+                        except Exception:
+                            pass
+                    else:
+                        await asyncio.sleep(0.5)
+
+            # STRICT CHECK: Photos Count
+            for _ in range(2):
+                try: 
+                    result["photos"] = str(await app.search_messages_count(chat.id, filter=enums.MessagesFilter.PHOTO))
+                    break
+                except FloodWait as fw:
+                    await asyncio.sleep(fw.value + 1)
+                except Exception: 
+                    pass
+
             # Initial forward check (Bulletproof Check Added Here)
             has_protected = bool(getattr(chat, 'has_protected_content', False))
             
             if not has_protected:
                 try:
-                    # Fetching up to 10 latest messages to double-check if the channel actually restricted forwarding.
-                    # This avoids service messages (like "User joined") which don't carry the protected flag properly.
-                    async for m_test in app.get_chat_history(chat.id, limit=10):
+                    # Fetching up to 20 latest messages to double-check if the channel actually restricted forwarding.
+                    async for m_test in app.get_chat_history(chat.id, limit=20):
                         if getattr(m_test, 'has_protected_content', False):
                             has_protected = True
                             break
-                except:
+                except Exception:
                     pass
             
             result["forward"] = "❌ Off" if has_protected else "✅ On"
@@ -478,57 +503,6 @@ async def try_check_link(app: Client, link: str):
             elif getattr(chat, 'type', None) == enums.ChatType.CHANNEL:
                 result["chatting"] = "❌ Off (Channel)"
                 result["add_member"] = "❌ Off (Channel)"
-
-            if joined_now:
-                await asyncio.sleep(2) 
-                
-            # STRICT CHECK: Videos Count and Correct Forward Status
-            for _ in range(2): 
-                try: 
-                    result["videos"] = str(await app.search_messages_count(chat.id, filter=enums.MessagesFilter.VIDEO))
-                    break
-                except FloodWait as fw:
-                    await asyncio.sleep(fw.value + 1)
-                except Exception as e: 
-                    # If fetching fails (usually because of ChatAdminRequired), we MUST join to extract accurately.
-                    if not joined_now:
-                        try:
-                            await app.join_chat(link)
-                            joined_now = True
-                            await asyncio.sleep(2)
-                            
-                            # Re-fetch chat object to ensure has_protected_content is updated accurately
-                            chat = await app.get_chat(chat.id)
-                            has_protected_new = bool(getattr(chat, 'has_protected_content', False))
-                            
-                            if not has_protected_new:
-                                try:
-                                    # Fetching up to 10 latest messages for accuracy
-                                    async for m_test in app.get_chat_history(chat.id, limit=10):
-                                        if getattr(m_test, 'has_protected_content', False):
-                                            has_protected_new = True
-                                            break
-                                except:
-                                    pass
-                                    
-                            result["forward"] = "❌ Off" if has_protected_new else "✅ On"
-                            
-                            result["videos"] = str(await app.search_messages_count(chat.id, filter=enums.MessagesFilter.VIDEO))
-                            break
-                        except Exception:
-                            await asyncio.sleep(0.5)
-                    else:
-                        await asyncio.sleep(0.5)
-                    
-            # STRICT CHECK: Photos Count
-            for _ in range(2):
-                try: 
-                    result["photos"] = str(await app.search_messages_count(chat.id, filter=enums.MessagesFilter.PHOTO))
-                    break
-                except FloodWait as fw:
-                    await asyncio.sleep(fw.value + 1)
-                except Exception: 
-                    pass
 
         # Cleanup
         if joined_now and chat:
@@ -872,7 +846,6 @@ async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True):
             
         total_extracted = 0
         if uid not in SCRAPER_DUPLICATES: SCRAPER_DUPLICATES[uid] = set()
-        # SCRAPER_DUPLICATES is NOT cleared automatically unless Force Target is used
         
         if manual:
             prog_resp = await _send_raw(cid, f"🔄 <b>Starting Deep Scrape from {len(targets)} Targets...</b>\n<i>(Extracting links, tracking progress)</i>")
@@ -894,13 +867,18 @@ async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True):
                     except UserAlreadyParticipant:
                         chat = await app.get_chat(chat_target)
                 elif isinstance(chat_target, str) and "t.me/" in chat_target:
-                    if "/c/" in chat_target:
-                        parts = chat_target.split("/c/")[1].split("/")
-                        chat_id = int("-100" + parts[0])
-                        chat = await app.get_chat(chat_id)
-                    else:
-                        username = chat_target.split("t.me/")[1].split("/")[0].split("?")[0]
-                        chat = await app.get_chat(username)
+                    try:
+                        if "/c/" in chat_target:
+                            parts = chat_target.split("/c/")[1].split("/")
+                            if len(parts) > 0 and parts[0].isdigit():
+                                chat_id = int("-100" + parts[0])
+                                chat = await app.get_chat(chat_id)
+                        else:
+                            username = chat_target.split("t.me/")[1].split("/")[0].split("?")[0]
+                            chat = await app.get_chat(username)
+                    except Exception as e:
+                        print(f"[{datetime.now()}] ⚠️ Link parsing error for target {target}: {e}")
+                        continue
                 else:
                     chat = await app.get_chat(chat_target)
 
