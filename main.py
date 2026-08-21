@@ -444,40 +444,23 @@ async def try_check_link(app: Client, link: str):
                 except: pass
             if mem_count: result["members"] = str(mem_count)
             
-            # --- ROBUST DATA FETCHING & FORCED JOIN ---
-            messages_tested = []
-            access_granted = False
-            try:
-                # 15 messages fetch ensures we bypass service messages and accurately check forwarding
-                async for m_test in app.get_chat_history(chat.id, limit=15):
-                    messages_tested.append(m_test)
-                access_granted = True
-            except Exception:
-                pass
-                
-            if not access_granted and not joined_now:
-                try:
-                    await app.join_chat(link)
-                    joined_now = True
-                    await asyncio.sleep(2)
-                    chat = await app.get_chat(chat.id)
-                    async for m_test in app.get_chat_history(chat.id, limit=15):
-                        messages_tested.append(m_test)
-                except Exception:
-                    pass
-
-            # --- CHECK FORWARD STATUS (Bulletproof) ---
+            # Initial forward check (Bulletproof Check Added Here)
             has_protected = bool(getattr(chat, 'has_protected_content', False))
+            
             if not has_protected:
-                for m_test in messages_tested:
-                    # If ANY normal message is protected, the whole channel has forwarding disabled
-                    if getattr(m_test, 'has_protected_content', False):
-                        has_protected = True
-                        break
+                try:
+                    # Fetching up to 10 latest messages to double-check if the channel actually restricted forwarding.
+                    # This avoids service messages (like "User joined") which don't carry the protected flag properly.
+                    async for m_test in app.get_chat_history(chat.id, limit=10):
+                        if getattr(m_test, 'has_protected_content', False):
+                            has_protected = True
+                            break
+                except:
+                    pass
             
             result["forward"] = "❌ Off" if has_protected else "✅ On"
             
-            # --- CHECK CHATTING & ADD MEMBER PERMISSIONS ---
+            # Chatting and Add Member Check (Refined Permissions Logic)
             if getattr(chat, 'type', None) in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP]:
                 can_txt = True
                 can_med = True
@@ -498,17 +481,46 @@ async def try_check_link(app: Client, link: str):
 
             if joined_now:
                 await asyncio.sleep(2) 
-
-            # --- GET VIDEO & PHOTO COUNTS ---
+                
+            # STRICT CHECK: Videos Count and Correct Forward Status
             for _ in range(2): 
                 try: 
                     result["videos"] = str(await app.search_messages_count(chat.id, filter=enums.MessagesFilter.VIDEO))
                     break
                 except FloodWait as fw:
                     await asyncio.sleep(fw.value + 1)
-                except Exception: 
-                    await asyncio.sleep(0.5)
+                except Exception as e: 
+                    # If fetching fails (usually because of ChatAdminRequired), we MUST join to extract accurately.
+                    if not joined_now:
+                        try:
+                            await app.join_chat(link)
+                            joined_now = True
+                            await asyncio.sleep(2)
+                            
+                            # Re-fetch chat object to ensure has_protected_content is updated accurately
+                            chat = await app.get_chat(chat.id)
+                            has_protected_new = bool(getattr(chat, 'has_protected_content', False))
+                            
+                            if not has_protected_new:
+                                try:
+                                    # Fetching up to 10 latest messages for accuracy
+                                    async for m_test in app.get_chat_history(chat.id, limit=10):
+                                        if getattr(m_test, 'has_protected_content', False):
+                                            has_protected_new = True
+                                            break
+                                except:
+                                    pass
+                                    
+                            result["forward"] = "❌ Off" if has_protected_new else "✅ On"
+                            
+                            result["videos"] = str(await app.search_messages_count(chat.id, filter=enums.MessagesFilter.VIDEO))
+                            break
+                        except Exception:
+                            await asyncio.sleep(0.5)
+                    else:
+                        await asyncio.sleep(0.5)
                     
+            # STRICT CHECK: Photos Count
             for _ in range(2):
                 try: 
                     result["photos"] = str(await app.search_messages_count(chat.id, filter=enums.MessagesFilter.PHOTO))
@@ -1358,7 +1370,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data["mode"] = ""
         state = load_scraper_state(uid)
         daily_stats = state.get("daily_stats", 0)
-        await _edit_raw(cid, mid, f"👑 <b>Link Checker Pro</b>\n\n📊 <b>Scraping Status Today:</b> {daily_stats} Links Extracted\n\nManage Checkers, Scrapers and Channels here.", PRO_KB(uid))
+        await _edit_raw(cid, mid, f"👑 <b>Link Checker Pro</b>\n\n📊 <b>Scraping Status Today:</b> {daily_stats} Links Extracted\n\nManage Checkers, Scrapers and Channels working securely on VPS.", PRO_KB(uid))
 
     elif d == "menu_extractor_main":
         ctx.user_data["mode"] = ""
