@@ -268,27 +268,54 @@ def parse_msg_link(link: str):
 
 async def fast_http_link_check(link: str) -> str:
     link = link.strip().rstrip("-.,_ \n\t*`~")
-    for _ in range(1):
+    
+    # User Request: Do baar check karo (Retry mechanism for accuracy 3 times)
+    for _ in range(3): 
         try:
             async with aiohttp.ClientSession() as s:
-                headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-                async with s.get(link, timeout=3, headers=headers) as resp:
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Cache-Control": "no-cache"
+                }
+                async with s.get(link, timeout=5, headers=headers, allow_redirects=True) as resp:
                     if resp.status == 200:
                         text = await resp.text()
-                        if any(x in text for x in ["Invite link is invalid", "Link is invalid", "has expired"]):
-                            return "expired" 
-                        if "If you have Telegram, you can contact" in text and "@" in text:
-                            if "Join Channel" not in text and "Send Message" not in text and "View in Telegram" not in text:
-                                return "unknown"
-                        if any(x in text for x in ["Join Group", "Join Channel", "View in Telegram", "View Channel"]):
+                        
+                        # 1. 100% Strict check for Expired / Invalid text
+                        expired_phrases = [
+                            "Invite link is invalid", 
+                            "Link is invalid", 
+                            "has expired",
+                            "tgme_page_icon_error",
+                            "not found",
+                            "is inaccessible",
+                            "user does not exist",
+                            "no longer valid",
+                            "doesn't exist"
+                        ]
+                        if any(phrase in text for phrase in expired_phrases):
+                            return "expired"
+                            
+                        # 2. 100% Strict check for Active links
+                        # Only legitimate active links will display the Telegram action button
+                        if 'class="tgme_action_button_new"' in text or 'class="tgme_page_button_new"' in text:
                             return "active"
-                        return "unknown"
+                            
+                        # 3. Fallback: if page loaded properly but has no active button -> Expired
+                        if 'tgme_page_wrap' in text or 'tgme_page_title' in text:
+                            return "expired"
+                            
                     elif resp.status == 404:
-                        return "unknown" 
+                        return "expired" 
                     elif resp.status == 429:
-                        await asyncio.sleep(0.5)
-        except:
-            await asyncio.sleep(0.1)
+                        await asyncio.sleep(1)
+                        continue
+                        
+        except Exception:
+            await asyncio.sleep(1)
+            
+    # Default to unknown only if network completely blocks all 3 attempts
     return "unknown"
 
 async def try_check_link(app: Client, link: str):
@@ -1244,7 +1271,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     elif d == "menu_guest":
         ctx.user_data["mode"] = "guest_check"
-        await _edit_raw(cid, mid, "🔍 <b>Guest Mode (No Account Needed)</b>\n\nJust send me any links here. I will do a basic scan and tell you if they are Active or Expired.\n\n<i>Note: This mode doesn't check Members, Photos, Chat features etc.</i>", [[{"text": "🔙 Back", "callback_data": "back_start"}]])
+        await _edit_raw(cid, mid, "🔍 <b>Guest Mode (No Account Needed)</b>\n\nJust send me any links here. I will do a strict scan and tell you if they are Active or Expired.\n\n<i>Note: This mode doesn't check Members, Photos, Chat features etc.</i>", [[{"text": "🔙 Back", "callback_data": "back_start"}]])
 
     elif d == "menu_pro":
         ctx.user_data["mode"] = ""
@@ -1505,26 +1532,53 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         asyncio.create_task(_run_media_extractor(uid, cid, text, ext_mode, target_upload_id))
         return
 
-    if mode == "guest_check":
+    elif mode == "guest_check":
         links = extract_links(text)
         if not links:
             await update.message.reply_text("❌ No valid Telegram links found.", parse_mode="HTML")
             return
         
-        msg = await update.message.reply_text("⏳ <b>Checking links without account...</b>", parse_mode="HTML")
-        res_text = "🔍 <b>Guest Check Results</b>\n━━━━━━━━━━\n"
+        msg = await update.message.reply_text(f"⏳ <b>Checking {len(links)} links without account...</b>\n<i>Please wait, ensuring 100% accuracy...</i>", parse_mode="HTML")
+        
+        active_links = []
+        expired_links = []
+        unknown_links = []
         
         for l in links:
             status = await fast_http_link_check(l)
-            if status == "expired":
-                res_text += f"❌ {l} - Expired/Invalid\n"
-            elif status == "active":
-                res_text += f"✅ {l} - Active Link\n"
+            if status == "active":
+                active_links.append(l)
+            elif status == "expired":
+                expired_links.append(l)
             else:
-                res_text += f"⚠️ {l} - Unknown/Requires Login\n"
+                unknown_links.append(l)
                 
-        res_text += "\n<i>(For advanced stats, login via Link Pro)</i>"
-        await msg.edit_text(res_text, disable_web_page_preview=True, parse_mode="HTML")
+        def chunk_message(title, link_list, icon):
+            if not link_list: return []
+            chunks = []
+            current_chunk = f"<b>{title} ({len(link_list)}):</b>\n\n"
+            for l in link_list:
+                line = f"{icon} {l}\n"
+                if len(current_chunk) + len(line) > 3800:
+                    chunks.append(current_chunk)
+                    current_chunk = f"<b>{title} (Continued):</b>\n\n"
+                current_chunk += line
+            if current_chunk: chunks.append(current_chunk)
+            return chunks
+
+        all_chunks = []
+        if active_links: all_chunks.extend(chunk_message("✅ ACTIVE LINKS", active_links, "✅"))
+        if expired_links: all_chunks.extend(chunk_message("❌ EXPIRED LINKS", expired_links, "❌"))
+        if unknown_links: all_chunks.extend(chunk_message("⚠️ UNKNOWN LINKS", unknown_links, "⚠️"))
+
+        if not all_chunks:
+            await msg.edit_text("No results.", parse_mode="HTML")
+            return
+            
+        await msg.edit_text(all_chunks[0], disable_web_page_preview=True, parse_mode="HTML")
+        
+        for chunk in all_chunks[1:]:
+            await update.message.reply_text(chunk, disable_web_page_preview=True, parse_mode="HTML")
 
     elif mode == "scraper_target":
         state = load_scraper_state(uid)
@@ -1719,4 +1773,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
