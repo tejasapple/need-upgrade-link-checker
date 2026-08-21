@@ -1101,9 +1101,11 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False
                     fetched_msg = None
                     messages_received = 0
                     try:
-                        c_app = CHECKER_STATE[uid]["clients"][client_keys[0]]["app"]
+                        # FIX: Using PYRO_BOT instead of c_app (Checker IDs). 
+                        # Checker IDs might not be in the Storage Channel and cause silent ChannelPrivate errors.
+                        # PYRO_BOT is the bot itself, which has Admin access to the Storage channel.
                         msg_ids_to_fetch = list(range(storage_last_msg_id, storage_last_msg_id + 50))
-                        messages = await c_app.get_messages(get_conf("STORAGE_CHANNEL_ID"), msg_ids_to_fetch)
+                        messages = await PYRO_BOT.get_messages(get_conf("STORAGE_CHANNEL_ID"), msg_ids_to_fetch)
                         
                         links_found_in_batch = False
                         
@@ -1132,11 +1134,13 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False
                             empty_storage_batches += 1
                             
                     except Exception as e:
+                        logger.error(f"Storage Queue Error: {e}")
+                        empty_storage_batches += 1 # FIX: Ensure we don't get stuck in an infinite loop
                         pass
                     
                     if not USER_QUEUES.get(uid):
                         await _update_dashboard_if_needed(uid, force=True)
-                        if empty_storage_batches > 20: 
+                        if empty_storage_batches > 40: # FIX: Increased limit to handle larger message gaps
                             await _send_raw(cid, "✅ <b>Storage Checking Paused/Finished.</b>\nReached the end of available messages in Storage. Will re-check soon if resumed.")
                             break
                         
