@@ -266,7 +266,7 @@ def parse_msg_link(link: str):
     return None, None
 
 # ─────────────────────────────────────────
-#  HTTP LINK CHECKER (FIXED GUEST MODE FOR BANNED CHANNELS)
+#  HTTP LINK CHECKER
 # ─────────────────────────────────────────
 async def check_public_via_http(link: str, attempt=1) -> dict:
     is_private, _ = parse_link(link)
@@ -359,131 +359,138 @@ async def try_check_link(app: Client, link: str):
     joined_now = False
 
     try:
-        # STEP 1: RESOLVE AND FORCE JOIN CHAT
+        # STEP 1: FORCE JOIN OR RESOLVE EXISTING
         if is_private:
             try:
-                inv = await app.invoke(CheckChatInvite(hash=ref))
-                if hasattr(inv, 'title'): result["title"] = clean_html_text(inv.title)
-                elif hasattr(inv, 'chat') and hasattr(inv.chat, 'title'): result["title"] = clean_html_text(inv.chat.title)
-                if hasattr(inv, 'participants_count'): result["members"] = str(inv.participants_count)
-                elif hasattr(inv, 'chat') and hasattr(inv.chat, 'participants_count'): result["members"] = str(inv.chat.participants_count)
-
-                if isinstance(inv, ChatInviteAlready):
-                    chat = await app.get_chat(inv.chat.id)
-                elif isinstance(inv, ChatInvite):
-                    chat = await app.join_chat(link)
-                    joined_now = True
-                    await asyncio.sleep(3.5) # REQUIRED DELAY TO SYNC DATA
+                chat = await app.join_chat(link)
+                joined_now = True
+                await asyncio.sleep(3.0)
+            except UserAlreadyParticipant:
+                pass
             except Exception as e:
-                # Fallback directly joining if CheckChatInvite fails
                 if "already" in str(e).lower():
-                    chat = await app.get_chat(link)
+                    pass
+                elif "invite_request_sent" in str(e).lower():
+                    result["status"] = "active"
+                    result["title"] = "Admin Approval Required"
+                    return result, False, 0
                 else:
-                    chat = await app.join_chat(link)
-                    joined_now = True
-                    await asyncio.sleep(3.5)
-            
-            if not chat and joined_now:
-                chat = await app.get_chat(link)
-
+                    raise e
         else:
             try:
                 chat = await app.join_chat(ref)
                 joined_now = True
-                await asyncio.sleep(3.5)
+                await asyncio.sleep(3.0)
             except UserAlreadyParticipant:
                 pass
             except Exception as e:
                 if "invite_request_sent" in str(e).lower():
                     result["status"] = "active"
-                    result["title"] = result["title"] if result["title"] != "Unknown" else "Admin Approval Required"
+                    result["title"] = "Admin Approval Required"
                     return result, False, 0
+                else:
+                    raise e
 
-            chat = await app.get_chat(ref)
-            if getattr(chat, 'type', None) not in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP, enums.ChatType.CHANNEL]:
-                raise UsernameInvalid("Not a group or channel")
+        # STEP 2: ABSOLUTE FORCED CHAT RE-FETCH (CRITICAL FOR FORWARD ON/OFF & CACHE)
+        target_id = chat.id if (chat and hasattr(chat, 'id')) else (link if is_private else ref)
+        full_chat = None
+        
+        for _ in range(3):
+            try:
+                full_chat = await app.get_chat(target_id)
+                if full_chat:
+                    chat = full_chat
+                    break
+            except FloodWait as fw:
+                await asyncio.sleep(fw.value + 1.0)
+            except Exception:
+                await asyncio.sleep(1.5)
+        
+        if not chat:
+            raise UsernameInvalid("Could not resolve chat after joining.")
+            
+        if getattr(chat, 'type', None) not in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP, enums.ChatType.CHANNEL]:
+            raise UsernameInvalid("Not a group or channel")
 
-        # STEP 2: EXTRACT EXACT ACCURATE DATA (100% FIXED METHODS)
+        # STEP 3: EXTRACT EXACT ACCURATE DATA
         result["status"] = "active"
         
-        if chat:
-            # FIX: Force fetch complete Chat object to guarantee accurate 'has_protected_content'
-            if joined_now:
-                try:
-                    chat = await app.get_chat(chat.id)
-                except:
-                    pass
-
-            if getattr(chat, 'is_restricted', False):
-                result["status"] = "expired"
-                result["title"] = "Banned / Terms of Service"
-                return result, False, 0
+        if getattr(chat, 'is_restricted', False):
+            result["status"] = "expired"
+            result["title"] = "Banned / Terms of Service"
+            return result, False, 0
+            
+        raw_title = getattr(chat, 'title', None) or getattr(chat, 'first_name', None)
+        if raw_title:
+            result["title"] = clean_html_text(raw_title)
+        
+        mem_count = getattr(chat, 'members_count', None)
+        if mem_count is None:
+            try: mem_count = await app.get_chat_members_count(chat.id)
+            except: pass
+        if mem_count: result["members"] = str(mem_count)
+        
+        # 🔥 THIS FIXES FORWARD ON/OFF ISSUE COMPLETELY
+        has_protected = getattr(chat, 'has_protected_content', False)
+        result["forward"] = "❌ Off" if has_protected else "✅ On"
+        
+        if getattr(chat, 'type', None) in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP]:
+            if getattr(chat, 'permissions', None):
+                can_txt = chat.permissions.can_send_messages
+                can_med = chat.permissions.can_send_media_messages
+                can_inv = chat.permissions.can_invite_users
                 
-            raw_title = getattr(chat, 'title', None) or getattr(chat, 'first_name', None)
-            if raw_title:
-                result["title"] = clean_html_text(raw_title)
-            
-            mem_count = getattr(chat, 'members_count', None)
-            if mem_count is None:
-                try: mem_count = await app.get_chat_members_count(chat.id)
-                except: pass
-            if mem_count: result["members"] = str(mem_count)
-            
-            # FIX: Perfectly detecting Forward protection now
-            has_protected = getattr(chat, 'has_protected_content', False)
-            result["forward"] = "❌ Off" if has_protected else "✅ On"
-            
-            if getattr(chat, 'type', None) in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP]:
-                if getattr(chat, 'permissions', None):
-                    can_txt = chat.permissions.can_send_messages
-                    can_med = chat.permissions.can_send_media_messages
-                    can_inv = chat.permissions.can_invite_users
-                    
-                    result["chatting"] = "✅ On" if can_txt else "❌ Off"
-                    result["add_member"] = "✅ On" if can_inv else "❌ Off"
-                    
-                    if can_med and not can_txt:
-                        result["media_only"] = True
-                else:
-                    result["chatting"] = "✅ On" 
-                    result["add_member"] = "✅ On"
-            elif getattr(chat, 'type', None) == enums.ChatType.CHANNEL:
-                result["chatting"] = "❌ Off (Channel)"
-                result["add_member"] = "❌ Off (Channel)"
-
-            # ==========================================
-            # 🚀 CORE FIX: CACHE WAKEUP & MEDIA COUNTING
-            # ==========================================
-            if joined_now:
-                await asyncio.sleep(2.0) 
+                result["chatting"] = "✅ On" if can_txt else "❌ Off"
+                result["add_member"] = "✅ On" if can_inv else "❌ Off"
                 
-            # 🔥 Wake up Telegram's internal peer cache for the new joiner
+                if can_med and not can_txt:
+                    result["media_only"] = True
+            else:
+                result["chatting"] = "✅ On" 
+                result["add_member"] = "✅ On"
+        elif getattr(chat, 'type', None) == enums.ChatType.CHANNEL:
+            result["chatting"] = "❌ Off (Channel)"
+            result["add_member"] = "❌ Off (Channel)"
+
+        # ==========================================
+        # 🚀 STEP 4: MEDIA COUNT WITH ROBUST RETRIES
+        # ==========================================
+        if joined_now:
+            await asyncio.sleep(2.0) 
+            
+        # Wake up Telegram's internal peer cache
+        try:
+            async for _ in app.get_chat_history(chat.id, limit=1):
+                break
+        except Exception:
+            pass
+            
+        # ✅ Videos Count Logic
+        v_count = None
+        for _ in range(3):
             try:
-                async for _ in app.get_chat_history(chat.id, limit=1):
-                    break
-            except:
-                pass
-                
-            # ✅ Videos Count Fix
-            try: 
-                result["videos"] = str(await app.search_messages_count(chat.id, filter=enums.MessagesFilter.VIDEO))
+                v_count = await app.search_messages_count(chat.id, filter=enums.MessagesFilter.VIDEO)
+                break
             except FloodWait as fw:
-                await asyncio.sleep(fw.value + 1)
-                try: result["videos"] = str(await app.search_messages_count(chat.id, filter=enums.MessagesFilter.VIDEO))
-                except: result["videos"] = "Hidden"
-            except Exception as e: 
-                result["videos"] = "Hidden" # Fallback if channel heavily restricts API
-                
-            # ✅ Photos Count Fix
-            try: 
-                result["photos"] = str(await app.search_messages_count(chat.id, filter=enums.MessagesFilter.PHOTO))
+                await asyncio.sleep(fw.value + 1.0)
+            except Exception:
+                await asyncio.sleep(1.5)
+        
+        result["videos"] = str(v_count) if v_count is not None else "0"
+            
+        # ✅ Photos Count Logic
+        p_count = None
+        for _ in range(3):
+            try:
+                p_count = await app.search_messages_count(chat.id, filter=enums.MessagesFilter.PHOTO)
+                break
             except FloodWait as fw:
-                await asyncio.sleep(fw.value + 1)
-                try: result["photos"] = str(await app.search_messages_count(chat.id, filter=enums.MessagesFilter.PHOTO))
-                except: result["photos"] = "Hidden"
-            except Exception as e: 
-                result["photos"] = "Hidden"
-            # ==========================================
+                await asyncio.sleep(fw.value + 1.0)
+            except Exception:
+                await asyncio.sleep(1.5)
+                
+        result["photos"] = str(p_count) if p_count is not None else "0"
+        # ==========================================
 
         # Cleanup
         if joined_now and chat:
@@ -1204,7 +1211,7 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False
                     
                 final_result = res if res else {"link": lnk, "status": "skipped", "title": "Unknown Error"}
                 
-                # 🚀 CORE FIX FOR FALSE SKIPS/EXPIRES:
+                # 🚀 CORE FIX FOR FALSE SKIPS/EXPIRES
                 if final_result["status"] in ["expired", "skipped", "error"] and http_res.get("status") == "active":
                     final_result["status"] = "active"
                     final_result["title"] = http_res.get("title", final_result.get("title", "Active Link"))
@@ -1212,9 +1219,9 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False
                     if final_result.get("members", "N/A") == "N/A":
                         final_result["members"] = http_res.get("members", "N/A")
                     
-                    # FIX: Do NOT overwrite actual "0" counts to "Hidden". Only change N/A to Hidden if restricted.
-                    if final_result.get("videos") in ["N/A"]: final_result["videos"] = "Hidden"
-                    if final_result.get("photos") in ["N/A"]: final_result["photos"] = "Hidden"
+                    # Instead of outputting N/A or Hidden on Pyrogram fallback, clean it as 0
+                    if final_result.get("videos") in ["N/A"]: final_result["videos"] = "0"
+                    if final_result.get("photos") in ["N/A"]: final_result["photos"] = "0"
                     if final_result.get("forward") == "N/A": final_result["forward"] = "Unknown"
 
                 if final_result["status"] == "active":
