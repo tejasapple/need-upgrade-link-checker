@@ -805,7 +805,7 @@ async def _run_media_extractor(uid: int, cid: int, target_link: str, mode: str, 
 # ─────────────────────────────────────────
 #  SCRAPER & AUTO-UPDATES (UPGRADED DUAL ID & FALLBACK)
 # ─────────────────────────────────────────
-async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True):
+async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True, scrape_choice="both"):
     scraper_sessions = get_user_sessions(uid, "scraper")
     if not scraper_sessions:
         if manual: await _send_raw(cid, "❌ No Scraper IDs logged in! Please add an account in Scraper Menu.")
@@ -829,7 +829,8 @@ async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True):
     if uid not in SCRAPER_DUPLICATES: SCRAPER_DUPLICATES[uid] = set()
 
     if manual:
-        await _send_raw(cid, f"🔄 <b>Starting Deep Scrape...</b>\n<i>(Processing ID 1 & ID 2 with Auto-Fallback & Strict Anti-Ban)</i>")
+        mode_str = "(Processing Both IDs with Auto-Fallback)" if scrape_choice == "both" else f"(Processing ONLY ID {scrape_choice})"
+        await _send_raw(cid, f"🔄 <b>Starting Deep Scrape...</b>\n<i>{mode_str}</i>")
 
     # Core Execution function to process lists seamlessly
     async def _scrape_core(app_path, t_dict):
@@ -935,23 +936,26 @@ async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True):
         
         return results
 
-    # 1. Scrape ID 1 targets using ID 1
-    res1 = await _scrape_core(id1_path, targets_1)
-    for t, nid in res1.get("new_states", {}).items(): targets_1[t] = nid
-    
-    # 2. Scrape ID 2 targets using ID 2
-    res2 = await _scrape_core(id2_path, targets_2)
-    for t, nid in res2.get("new_states", {}).items(): targets_2[t] = nid
-    
-    # 3. Auto-Fallback System: Process failed ID 1 targets using ID 2
-    if res1.get("failed_targets") and id2_path:
-        res_fail1 = await _scrape_core(id2_path, res1["failed_targets"])
-        for t, nid in res_fail1.get("new_states", {}).items(): targets_1[t] = nid
+    res1 = {}
+    res2 = {}
+
+    if scrape_choice in ["1", "both"]:
+        res1 = await _scrape_core(id1_path, targets_1)
+        for t, nid in res1.get("new_states", {}).items(): targets_1[t] = nid
         
-    # 4. Auto-Fallback System: Process failed ID 2 targets using ID 1
-    if res2.get("failed_targets") and id1_path:
-        res_fail2 = await _scrape_core(id1_path, res2["failed_targets"])
-        for t, nid in res_fail2.get("new_states", {}).items(): targets_2[t] = nid
+    if scrape_choice in ["2", "both"]:
+        res2 = await _scrape_core(id2_path, targets_2)
+        for t, nid in res2.get("new_states", {}).items(): targets_2[t] = nid
+        
+    if scrape_choice == "both":
+        # Auto-Fallback System
+        if res1.get("failed_targets") and id2_path:
+            res_fail1 = await _scrape_core(id2_path, res1["failed_targets"])
+            for t, nid in res_fail1.get("new_states", {}).items(): targets_1[t] = nid
+            
+        if res2.get("failed_targets") and id1_path:
+            res_fail2 = await _scrape_core(id1_path, res2["failed_targets"])
+            for t, nid in res_fail2.get("new_states", {}).items(): targets_2[t] = nid
 
     state["last_run"] = time.time()
     state["daily_stats"] += total_extracted
@@ -1002,7 +1006,7 @@ async def auto_scraper_loop():
                             if SCRAPER_TASKS.get(uid) != "running":
                                 print(f"[{datetime.now()}] 🔄 Starting Auto-Scrape for UID: {uid} (Scheduled Timing)")
                                 SCRAPER_TASKS[uid] = "running"
-                                asyncio.create_task(_run_daily_scraper_task(uid, uid, state, manual=False))
+                                asyncio.create_task(_run_daily_scraper_task(uid, uid, state, manual=False, scrape_choice="both"))
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -1578,10 +1582,34 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await _edit_raw(cid, mid, "⚠️ Scraper is already running!", [[{"text": "🔙 Back", "callback_data": "menu_pro"}]])
             return
         
+        kb = [
+            [{"text": "▶️ Scrape Only ID 1", "callback_data": "force_scrape_1"}],
+            [{"text": "▶️ Scrape Only ID 2", "callback_data": "force_scrape_2"}],
+            [{"text": "🔄 Scrape Both (Auto-Fallback)", "callback_data": "force_scrape_both"}],
+            [{"text": "🔙 Back", "callback_data": "menu_pro"}]
+        ]
+        await _edit_raw(cid, mid, "📥 <b>Choose Scraper Mode</b>\n\nKaunse Scraper ID se manual scraping start karni hai?", kb)
+        
+    elif d.startswith("force_scrape_"):
+        if SCRAPER_TASKS.get(uid) == "running":
+            await _edit_raw(cid, mid, "⚠️ Scraper is already running!", [[{"text": "🔙 Back", "callback_data": "menu_pro"}]])
+            return
+            
+        choice = d.split("force_scrape_")[1]
         state = load_scraper_state(uid)
         SCRAPER_TASKS[uid] = "running"
-        asyncio.create_task(_run_daily_scraper_task(uid, cid, state, manual=True))
-        await _edit_raw(cid, mid, "✅ Initiating Smart Scrape...\nExtracting all target links across logged-in Scraper IDs with Backup logic enabled.", [[{"text": "🔙 Menu Pro", "callback_data": "menu_pro"}]])
+        
+        asyncio.create_task(_run_daily_scraper_task(uid, cid, state, manual=True, scrape_choice=choice))
+        
+        msg_text = "✅ Initiating Smart Scrape...\n"
+        if choice == "1":
+            msg_text += "Extracting targets for <b>ID 1</b> only."
+        elif choice == "2":
+            msg_text += "Extracting targets for <b>ID 2</b> only."
+        else:
+            msg_text += "Extracting all target links across both IDs with Backup logic enabled."
+            
+        await _edit_raw(cid, mid, msg_text, [[{"text": "🔙 Menu Pro", "callback_data": "menu_pro"}]])
 
     elif d == "menu_accounts":
         sessions = get_user_sessions(uid, "checker")
