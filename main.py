@@ -135,7 +135,7 @@ SCRAPER_TASKS = {}
 EXTRACTOR_TASKS = {} 
 
 # ─────────────────────────────────────────
-#  JSON STATE LOADERS (UPGRADED FOR DUAL ID)
+#  JSON STATE LOADERS
 # ─────────────────────────────────────────
 def load_scraper_state(uid: int) -> dict:
     default_state = {"targets_id1": {}, "targets_id2": {}, "auto_run": False, "last_run": 0, "daily_stats": 0}
@@ -145,7 +145,6 @@ def load_scraper_state(uid: int) -> dict:
                 data = json.load(f)
                 state = data.get(str(uid), default_state)
                 
-                # Migrate old format if exists
                 if "targets" in state:
                     if isinstance(state.get("targets"), list):
                         state["targets_id1"] = {str(t): 0 for t in state["targets"]}
@@ -352,7 +351,7 @@ async def check_public_via_http(link: str, attempt=1) -> dict:
     return result
 
 # ─────────────────────────────────────────
-#  DEEP LINK CHECKER PRO (COMPLETELY FIXED & UPGRADED)
+#  DEEP LINK CHECKER PRO
 # ─────────────────────────────────────────
 async def try_check_link(app: Client, link: str):
     is_private, ref = parse_link(link)
@@ -803,7 +802,7 @@ async def _run_media_extractor(uid: int, cid: int, target_link: str, mode: str, 
         EXTRACTOR_TASKS[uid] = False
 
 # ─────────────────────────────────────────
-#  SCRAPER & AUTO-UPDATES (UPGRADED DUAL ID & FALLBACK)
+#  SCRAPER & AUTO-UPDATES (UPGRADED DUAL ID & DELAY LOGIC)
 # ─────────────────────────────────────────
 async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True, scrape_choice="both"):
     scraper_sessions = get_user_sessions(uid, "scraper")
@@ -818,7 +817,6 @@ async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True, 
         if manual: await _send_raw(cid, "❌ No Targets set! Please Add Target first.")
         return
 
-    # Path Resolutions for Strict "ID 1" and "ID 2"
     id1_path = next((s for s in scraper_sessions if s.endswith("_1")), None)
     id2_path = next((s for s in scraper_sessions if s.endswith("_2")), None)
     
@@ -832,7 +830,6 @@ async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True, 
         mode_str = "(Processing Both IDs with Auto-Fallback)" if scrape_choice == "both" else f"(Processing ONLY ID {scrape_choice})"
         await _send_raw(cid, f"🔄 <b>Starting Deep Scrape...</b>\n<i>{mode_str}</i>")
 
-    # Core Execution function to process lists seamlessly
     async def _scrape_core(app_path, t_dict):
         nonlocal total_extracted
         results = {"extracted": 0, "failed_targets": {}, "new_states": {}}
@@ -849,7 +846,7 @@ async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True, 
 
         for target, last_msg_id in t_dict.items():
             print(f"[{datetime.now()}] 📡 Resolving & Scraping target: {target} via {app_path}")
-            await asyncio.sleep(random.uniform(5.0, 10.0)) # Deep Anti-ban sleep
+            await asyncio.sleep(random.uniform(5.0, 10.0)) 
             
             target_extracted = 0
             new_last_id = last_msg_id
@@ -863,7 +860,7 @@ async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True, 
                 if isinstance(chat_target, str) and ("t.me/+" in chat_target or "joinchat" in chat_target):
                     try:
                         chat = await app.join_chat(chat_target)
-                        await asyncio.sleep(random.uniform(8.0, 15.0)) # STRICT Anti-ban after join
+                        await asyncio.sleep(random.uniform(8.0, 15.0))
                     except UserAlreadyParticipant:
                         chat = await app.get_chat(chat_target)
                 elif isinstance(chat_target, str) and "t.me/" in chat_target:
@@ -896,7 +893,7 @@ async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True, 
                     if msg.id > new_last_id: new_last_id = msg.id
                         
                     msg_count += 1
-                    if msg_count % 20 == 0: await asyncio.sleep(random.uniform(4.0, 7.0)) # Anti-ban sleep inside loop
+                    if msg_count % 20 == 0: await asyncio.sleep(random.uniform(4.0, 7.0))
                         
                     text = (msg.text or msg.caption or "")
                     links = extract_links(text)
@@ -948,7 +945,6 @@ async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True, 
         for t, nid in res2.get("new_states", {}).items(): targets_2[t] = nid
         
     if scrape_choice == "both":
-        # Auto-Fallback System
         if res1.get("failed_targets") and id2_path:
             res_fail1 = await _scrape_core(id2_path, res1["failed_targets"])
             for t, nid in res_fail1.get("new_states", {}).items(): targets_1[t] = nid
@@ -967,13 +963,19 @@ async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True, 
     msg_done = f"✅ <b>Scraping Complete!</b>\nExtracted <code>{total_extracted}</code> links.\n\n"
     
     checker_sessions = get_user_sessions(uid, "checker")
+    
+    # 10 minutes delay logic before processing storage
     if checker_sessions and total_extracted > 0:
-        msg_done += "🤖 <i>Auto-starting Link Processing Queue from Storage...</i>"
+        msg_done += "🤖 <i>Auto-starting Link Processing Queue from Storage in 10 minutes...</i>\n*(If manually triggered, on_message will process it instantly)*"
         if manual: await _send_raw(cid, msg_done)
         
-        if not CHECKING_LOCKS.get(uid):
-            CHECKING_LOCKS[uid] = True
-            asyncio.create_task(_run_bulk_check(uid, cid, checker_sessions, auto_storage=True))
+        async def delayed_bulk_check():
+            await asyncio.sleep(600)  # Wait exactly 10 minutes
+            if not CHECKING_LOCKS.get(uid):
+                CHECKING_LOCKS[uid] = True
+                asyncio.create_task(_run_bulk_check(uid, cid, checker_sessions, auto_storage=True))
+                
+        asyncio.create_task(delayed_bulk_check())
     else:
         if total_extracted == 0:
             msg_done += "No new links found since last check."
@@ -986,11 +988,6 @@ async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True, 
 async def auto_scraper_loop():
     while True:
         try:
-            now = datetime.now()
-            hour = now.hour
-            # Trigger specific timings: 8-9 AM, 2-3 PM, 8-9 PM
-            is_time_window = (8 <= hour < 9) or (14 <= hour < 15) or (20 <= hour < 21)
-            
             if os.path.exists(USERS_FILE):
                 with open(USERS_FILE, "r") as f:
                     users = f.read().splitlines()
@@ -1001,10 +998,10 @@ async def auto_scraper_loop():
                     
                     if state.get("auto_run", False):
                         last_run = state.get("last_run", 0)
-                        # Ensure it runs once per time window (4-hour cooldown lock)
-                        if is_time_window and (time.time() - last_run) >= (4 * 3600): 
+                        # Execute exactly every 8 hours (28800 seconds)
+                        if (time.time() - last_run) >= 28800: 
                             if SCRAPER_TASKS.get(uid) != "running":
-                                print(f"[{datetime.now()}] 🔄 Starting Auto-Scrape for UID: {uid} (Scheduled Timing)")
+                                print(f"[{datetime.now()}] 🔄 Starting Scheduled 8-Hour Auto-Scrape for UID: {uid}")
                                 SCRAPER_TASKS[uid] = "running"
                                 asyncio.create_task(_run_daily_scraper_task(uid, uid, state, manual=False, scrape_choice="both"))
         except asyncio.CancelledError:
@@ -1012,7 +1009,7 @@ async def auto_scraper_loop():
         except Exception as e:
             logger.error(f"Auto Scraper Loop Error: {e}")
             
-        await asyncio.sleep(600) # Checks every 10 minutes to properly catch the hour block
+        await asyncio.sleep(60) # Fast check every 1 minute to maintain strict 8 hours
 
 # ─────────────────────────────────────────
 #  NON-BLOCKING DASHBOARD UPDATER
@@ -1090,7 +1087,7 @@ async def _update_dashboard_if_needed(uid: int, force=False):
     except: pass
 
 # ─────────────────────────────────────────
-#  BULK RUNNER WITH QUEUE (WITH ANTI-FALSE-SKIP LOGIC)
+#  BULK RUNNER WITH QUEUE (00 BUG FIXED: ROBUST STORAGE FETCH)
 # ─────────────────────────────────────────
 async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False):
     QUEUE_CONTROL[uid] = "running"
@@ -1154,30 +1151,37 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False
                 if not auto_storage: 
                     break 
                 else:
-                    fetched_msg = None
+                    fetched_msgs = []
                     messages_received = 0
                     try:
-                        msg_ids_to_fetch = list(range(storage_last_msg_id, storage_last_msg_id + 50))
-                        messages = await PYRO_BOT.get_messages(get_conf("STORAGE_CHANNEL_ID"), msg_ids_to_fetch)
-                        
-                        links_found_in_batch = False
-                        
-                        for msg in messages:
-                            if not msg or msg.empty: continue
-                            messages_received += 1
-                            links = extract_links(msg.text or msg.caption or "")
+                        # Fixed 00 bug: Fetch real unread history accurately
+                        async for msg in PYRO_BOT.get_chat_history(get_conf("STORAGE_CHANNEL_ID"), limit=200):
+                            if msg.id <= storage_last_msg_id:
+                                break
+                            fetched_msgs.append(msg)
                             
-                            for l in links:
-                                if l not in CHECKER_DUPLICATES[uid]:
-                                    USER_QUEUES[uid].append({"link": l, "message_id": msg.id, "chat_id": get_conf("STORAGE_CHANNEL_ID")})
-                                    CHECKER_DUPLICATES[uid].add(l)
-                                    links_found_in_batch = True
-                                    if not fetched_msg: 
-                                        fetched_msg = msg
+                        links_found_in_batch = False
+                        fetched_msg = None
                         
-                        storage_last_msg_id += 50
-                        save_storage_state(uid, storage_last_msg_id)
-                        
+                        if fetched_msgs:
+                            fetched_msgs.reverse() # Start processing from oldest unread
+                            for msg in fetched_msgs:
+                                if not msg or msg.empty: continue
+                                messages_received += 1
+                                links = extract_links(msg.text or msg.caption or "")
+                                
+                                for l in links:
+                                    if l not in CHECKER_DUPLICATES[uid]:
+                                        USER_QUEUES[uid].append({"link": l, "message_id": msg.id, "chat_id": get_conf("STORAGE_CHANNEL_ID")})
+                                        CHECKER_DUPLICATES[uid].add(l)
+                                        links_found_in_batch = True
+                                        if not fetched_msg: 
+                                            fetched_msg = msg
+                                            
+                                storage_last_msg_id = max(storage_last_msg_id, msg.id)
+                                
+                            save_storage_state(uid, storage_last_msg_id)
+                            
                         if links_found_in_batch:
                             empty_storage_batches = 0
                             if fetched_msg:
@@ -1189,18 +1193,15 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False
                     except Exception as e:
                         logger.error(f"Storage Queue Error: {e}")
                         empty_storage_batches += 1
-                        pass
                     
                     if not USER_QUEUES.get(uid):
                         await _update_dashboard_if_needed(uid, force=True)
-                        if empty_storage_batches > 40: 
-                            await _send_raw(cid, "✅ <b>Storage Checking Paused/Finished.</b>\nReached the end of available messages in Storage. Will re-check soon if resumed.")
+                        if empty_storage_batches > 5: 
+                            await _send_raw(cid, "✅ <b>Storage Checking Paused/Finished.</b>\nReached the end of available messages in Storage. Queue is listening for new drops.")
                             break
                         
-                        if messages_received == 0:
-                            await asyncio.sleep(5) 
-                        else:
-                            await asyncio.sleep(0.1)
+                        if messages_received == 0: await asyncio.sleep(5) 
+                        else: await asyncio.sleep(0.1)
                         continue
 
             item = USER_QUEUES[uid].pop(0)
@@ -1478,13 +1479,10 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         asyncio.create_task(_run_bulk_check(uid, cid, sessions, auto_storage=True))
         await _edit_raw(cid, mid, "✅ <b>Forced Storage Checking Started!</b>\nAll valid links in the storage channel will be extracted and re-verified.", [[{"text": "🔙 Back", "callback_data": "menu_pro"}]])
 
-    # ─────────────────────────────────────────
-    # UPGRADED DUAL-ID UI MANAGER
-    # ─────────────────────────────────────────
     elif d == "menu_scraper":
         state = load_scraper_state(uid)
         scraper_sessions = get_user_sessions(uid, "scraper")
-        auto_stat = "✅ ON" if state.get("auto_run") else "❌ OFF"
+        auto_stat = "✅ ON (Every 8 Hrs)" if state.get("auto_run") else "❌ OFF"
         
         targets_1 = state.get("targets_id1", {})
         targets_2 = state.get("targets_id2", {})
@@ -1505,11 +1503,10 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 {"text": "🎯 Add Target (ID 2)", "callback_data": "scraper_add_target_2"},
                 {"text": "🗑 Rem Target (ID 2)", "callback_data": "scraper_rem_target_2"}
             ],
-            [{"text": f"🔄 Specific Time Auto-Scrape: {auto_stat}", "callback_data": "scraper_tog_auto"}],
+            [{"text": f"🔄 8-Hour Auto-Scrape: {auto_stat}", "callback_data": "scraper_tog_auto"}],
             [{"text": "🔙 Back", "callback_data": "menu_pro"}]
         ]
         
-        # Display up to 15 items neatly so msg limit isn't hit
         t1_items = list(targets_1.items())[:15]
         t1_list = "\n".join([f"• <code>{t}</code>" for t, m in t1_items]) if t1_items else "None"
         if len(targets_1) > 15: t1_list += f"\n...and {len(targets_1)-15} more"
@@ -1523,7 +1520,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"🎯 <b>Targets (ID 1):</b>\n{t1_list}\n\n"
                 f"👤 <b>Scraper ID 2:</b> {'✅ Logged In' if id2_active else '❌ Not Logged In'}\n"
                 f"🎯 <b>Targets (ID 2):</b>\n{t2_list}\n\n"
-                f"<i>(Anti-Ban + Fallback System Active: Agar ID 1 mein target scrape nahi hota, to ID 2 automatic check karega)</i>")
+                f"<i>(Anti-Ban + Fallback System Active: Agar ID 1 में target scrape नहीं होता, तो ID 2 automatic check करेगा)</i>")
         await _edit_raw(cid, mid, text, kb)
 
     elif d == "scraper_tog_auto":
@@ -1588,7 +1585,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             [{"text": "🔄 Scrape Both (Auto-Fallback)", "callback_data": "force_scrape_both"}],
             [{"text": "🔙 Back", "callback_data": "menu_pro"}]
         ]
-        await _edit_raw(cid, mid, "📥 <b>Choose Scraper Mode</b>\n\nKaunse Scraper ID se manual scraping start karni hai?", kb)
+        await _edit_raw(cid, mid, "📥 <b>Choose Scraper Mode</b>\n\nकौनसे Scraper ID से manual scraping start करनी है?", kb)
         
     elif d.startswith("force_scrape_"):
         if SCRAPER_TASKS.get(uid) == "running":
@@ -1667,15 +1664,50 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             
         await _edit_raw(cid, mid, f"🔗 <b>SEND LINKS NOW (MANUAL MODE)</b>\n\nSend up to unlimited links (Forward chunks smoothly).\nBot will process them securely using your {len(sessions)} logged-in IDs in the Account Bank.", [[{"text": "🔙 Back", "callback_data": "menu_pro"}]])
 
+# ─────────────────────────────────────────
+#  MESSAGE HANDLER (00 BUG & AUTO LISTENER FIXED)
+# ─────────────────────────────────────────
 async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not update.message: return
-    uid = update.effective_user.id; cid = update.effective_chat.id
-    text = (update.message.text or update.message.caption or "").strip()
+    msg = update.message or update.channel_post
+    if not msg: return
+    
+    cid = msg.chat.id
+    text = (msg.text or msg.caption or "").strip()
+    
+    # 1. Real-time Storage Channel Listener (Fixes Delay/Missing triggers)
+    if msg.chat.type == "channel":
+        if cid == get_conf("STORAGE_CHANNEL_ID"):
+            links = extract_links(text)
+            if links:
+                uid = ADMIN_ID 
+                if uid not in USER_QUEUES: USER_QUEUES[uid] = []
+                if uid not in CHECKER_DUPLICATES: CHECKER_DUPLICATES[uid] = set()
+                
+                added_count = 0
+                for l in links:
+                    if l not in CHECKER_DUPLICATES[uid]:
+                        USER_QUEUES[uid].append({"link": l, "message_id": msg.message_id, "chat_id": cid})
+                        CHECKER_DUPLICATES[uid].add(l)
+                        added_count += 1
+                
+                # Auto Start Queue without 10 mins delay directly on fresh storage drops
+                if added_count > 0 and not CHECKING_LOCKS.get(uid):
+                    checker_sessions = get_user_sessions(uid, "checker")
+                    if checker_sessions:
+                        CHECKING_LOCKS[uid] = True
+                        asyncio.create_task(_run_bulk_check(uid, cid, checker_sessions, auto_storage=True))
+        return
+
+    # 2. Prevent Bot interacting with unwanted groups unnecessarily
+    if msg.chat.type != "private" and msg.chat.type != "group" and msg.chat.type != "supergroup":
+        return
+
+    uid = msg.from_user.id if msg.from_user else ADMIN_ID
     mode = ctx.user_data.get("mode", "")
 
     if text == "/start" or text == "/cancel": 
         ctx.user_data["mode"] = ""
-        await update.message.reply_text("Action cancelled. Use /start again.")
+        await msg.reply_text("Action cancelled. Use /start again.")
         return 
 
     if mode.startswith("waiting_cfg_"):
@@ -1694,18 +1726,18 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             else:
                 kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Config", callback_data="menu_config_checker")]])
             
-            await update.message.reply_text(f"✅ <b>Success!</b>\n\n{cfg_name} has been updated to:\n<code>{new_id}</code>", parse_mode="HTML", reply_markup=kb)
+            await msg.reply_text(f"✅ <b>Success!</b>\n\n{cfg_name} has been updated to:\n<code>{new_id}</code>", parse_mode="HTML", reply_markup=kb)
         except ValueError:
-            await update.message.reply_text("❌ Invalid ID format. Please send a valid numeric Channel/Group ID (e.g. -1001234567).")
+            await msg.reply_text("❌ Invalid ID format. Please send a valid numeric Channel/Group ID (e.g. -1001234567).")
         return
 
     if mode in ["ext_single_wait", "ext_bulk_wait"]:
         if EXTRACTOR_TASKS.get(uid):
-            await update.message.reply_text("⚠️ Extraction already running. Please wait.")
+            await msg.reply_text("⚠️ Extraction already running. Please wait.")
             return
         
         if "t.me/" not in text:
-            await update.message.reply_text("❌ Please provide a valid Telegram message or bot link.")
+            await msg.reply_text("❌ Please provide a valid Telegram message or bot link.")
             return
             
         EXTRACTOR_TASKS[uid] = True
@@ -1719,10 +1751,10 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif mode == "guest_check":
         links = extract_links(text)
         if not links:
-            await update.message.reply_text("❌ No valid Telegram links found.", parse_mode="HTML")
+            await msg.reply_text("❌ No valid Telegram links found.", parse_mode="HTML")
             return
         
-        msg = await update.message.reply_text(f"⏳ <b>Checking {len(links)} links without account...</b>\n<i>Please wait, ensuring 100% accuracy...</i>", parse_mode="HTML")
+        wait_msg = await msg.reply_text(f"⏳ <b>Checking {len(links)} links without account...</b>\n<i>Please wait, ensuring 100% accuracy...</i>", parse_mode="HTML")
         
         active_links = []
         expired_links = []
@@ -1757,31 +1789,28 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if unknown_links: all_chunks.extend(chunk_message("⚠️ UNKNOWN LINKS", unknown_links, "⚠️"))
 
         if not all_chunks:
-            await msg.edit_text("No results.", parse_mode="HTML")
+            await wait_msg.edit_text("No results.", parse_mode="HTML")
             return
             
-        await msg.edit_text(all_chunks[0], disable_web_page_preview=True, parse_mode="HTML")
+        await wait_msg.edit_text(all_chunks[0], disable_web_page_preview=True, parse_mode="HTML")
         
         for chunk in all_chunks[1:]:
-            await update.message.reply_text(chunk, disable_web_page_preview=True, parse_mode="HTML")
+            await msg.reply_text(chunk, disable_web_page_preview=True, parse_mode="HTML")
 
-    # ─────────────────────────────────────────
-    # UPGRADED DUAL-TARGET SAVER
-    # ─────────────────────────────────────────
     elif mode in ["scraper_target_1", "scraper_target_2"]:
         slot = mode.split("_")[-1]
         target_val = None
         msg_id_to_save = 0
         
-        forward_origin = getattr(update.message, 'forward_origin', None)
+        forward_origin = getattr(msg, 'forward_origin', None)
         
         if forward_origin:
             if hasattr(forward_origin, 'chat') and forward_origin.chat:
                 target_val = str(forward_origin.chat.id)
             elif hasattr(forward_origin, 'sender_chat') and forward_origin.sender_chat:
                 target_val = str(forward_origin.sender_chat.id)
-        elif getattr(update.message, 'forward_from_chat', None):
-            target_val = str(update.message.forward_from_chat.id)
+        elif getattr(msg, 'forward_from_chat', None):
+            target_val = str(msg.forward_from_chat.id)
         else:
             text_val = text.strip()
             chat_val, m_id = parse_msg_link(text_val)
@@ -1798,14 +1827,14 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             state[target_key][target_val] = msg_id_to_save
             save_scraper_state(uid, state)
             
-            await update.message.reply_text(
+            await msg.reply_text(
                 f"✅ <b>Target Added to Scraper ID {slot}:</b> <code>{target_val}</code>", 
                 parse_mode="HTML", 
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="menu_scraper")]])
             )
             ctx.user_data["mode"] = ""
         else:
-            await update.message.reply_text("❌ <b>Invalid input.</b>\nPlease send a valid Chat ID, Username, or Message Link.")
+            await msg.reply_text("❌ <b>Invalid input.</b>\nPlease send a valid Chat ID, Username, or Message Link.")
 
     elif mode == "setting_delay":
         try:
@@ -1814,17 +1843,17 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 min_d, max_d = float(parts[0]), float(parts[1])
                 if min_d >= 0 and max_d >= min_d:
                     USER_DELAYS[uid] = (min_d, max_d)
-                    await update.message.reply_text(f"✅ <b>Delay Updated successfully!</b>\nNew Delay: {min_d}s - {max_d}s", parse_mode="HTML")
+                    await msg.reply_text(f"✅ <b>Delay Updated successfully!</b>\nNew Delay: {min_d}s - {max_d}s", parse_mode="HTML")
                     ctx.user_data["mode"] = ""
                     return
-            await update.message.reply_text("❌ <b>Invalid Input.</b>\nEnsure you send two numbers separated by space.", parse_mode="Markdown")
-        except: await update.message.reply_text("❌ <b>Invalid Format.</b>", parse_mode="Markdown")
+            await msg.reply_text("❌ <b>Invalid Input.</b>\nEnsure you send two numbers separated by space.", parse_mode="Markdown")
+        except: await msg.reply_text("❌ <b>Invalid Format.</b>", parse_mode="Markdown")
 
     elif mode == "login_phone":
         if not text.startswith("+") or len(text) < 10:
-            await update.message.reply_text("❌ Invalid format. Use +CountryCode Number")
+            await msg.reply_text("❌ Invalid format. Use +CountryCode Number")
             return
-        msg = await update.message.reply_text("⏳ Sending OTP...\n<i>Please check your main Telegram App for the code (Not SMS).</i>", parse_mode="HTML")
+        wait_msg = await msg.reply_text("⏳ Sending OTP...\n<i>Please check your main Telegram App for the code (Not SMS).</i>", parse_mode="HTML")
         try:
             ltype = ctx.user_data.get("login_type", "checker")
             if ltype == "scraper":
@@ -1851,30 +1880,30 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ctx.user_data["mode"] = "login_otp"
             
             print(f"[{datetime.now()}] ✅ OTP successfully sent to {text}")
-            await msg.edit_text("📩 OTP Sent to your Telegram App! Please send the OTP here.\n*(e.g., send `12345` or space-separated `1 2 3 4 5`)*", parse_mode="Markdown")
+            await wait_msg.edit_text("📩 OTP Sent to your Telegram App! Please send the OTP here.\n*(e.g., send `12345` or space-separated `1 2 3 4 5`)*", parse_mode="Markdown")
         except Exception as e:
             print(f"[{datetime.now()}] ❌ Failed to send OTP to {text}: {e}")
-            await msg.edit_text(f"❌ Error: {e}\n\n<i>If FloodWait occurs, try again later or use another number.</i>", parse_mode="HTML")
+            await wait_msg.edit_text(f"❌ Error: {e}\n\n<i>If FloodWait occurs, try again later or use another number.</i>", parse_mode="HTML")
             ctx.user_data["mode"] = ""
 
     elif mode == "login_otp":
         otp = text.replace(" ", "")
         if uid not in LOGIN_STATE: return
         data = LOGIN_STATE[uid]; app = data["app"]
-        msg = await update.message.reply_text("⏳ Verifying OTP...")
+        wait_msg = await msg.reply_text("⏳ Verifying OTP...")
         try:
             await app.sign_in(data["phone"], data["hash"], otp)
             await app.disconnect()
             del LOGIN_STATE[uid]; ctx.user_data["mode"] = ""
             print(f"[{datetime.now()}] ✅ Account successfully logged in via OTP!")
-            await msg.edit_text("✅ Login Successful!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('🔙 Menu', callback_data='back_start')]]))
+            await wait_msg.edit_text("✅ Login Successful!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('🔙 Menu', callback_data='back_start')]]))
         except SessionPasswordNeeded:
             ctx.user_data["mode"] = "login_pwd"
             print(f"[{datetime.now()}] 🔐 Two-Step Verification required for {data['phone']}")
-            await msg.edit_text("🔐 Two-Step Verification is ON. Send your Password:")
+            await wait_msg.edit_text("🔐 Two-Step Verification is ON. Send your Password:")
         except Exception as e:
             print(f"[{datetime.now()}] ❌ OTP Error: {e}")
-            await msg.edit_text(f"❌ Error: {e}"); 
+            await wait_msg.edit_text(f"❌ Error: {e}"); 
             try: await app.disconnect() 
             except: pass
             ctx.user_data["mode"] = ""
@@ -1882,16 +1911,16 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif mode == "login_pwd":
         if uid not in LOGIN_STATE: return
         app = LOGIN_STATE[uid]["app"]
-        msg = await update.message.reply_text("⏳ Verifying Password...")
+        wait_msg = await msg.reply_text("⏳ Verifying Password...")
         try:
             await app.check_password(text)
             await app.disconnect()
             del LOGIN_STATE[uid]; ctx.user_data["mode"] = ""
             print(f"[{datetime.now()}] ✅ Account successfully logged in via Password!")
-            await msg.edit_text("✅ Login Successful!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('🔙 Menu', callback_data='back_start')]]))
+            await wait_msg.edit_text("✅ Login Successful!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('🔙 Menu', callback_data='back_start')]]))
         except Exception as e:
             print(f"[{datetime.now()}] ❌ Password Error: {e}")
-            await msg.edit_text(f"❌ Error: {e}"); 
+            await wait_msg.edit_text(f"❌ Error: {e}"); 
             try: await app.disconnect() 
             except: pass
             ctx.user_data["mode"] = ""
@@ -1902,13 +1931,13 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             
         sessions = get_user_sessions(uid, "checker")
         if not sessions:
-            await update.message.reply_text("❌ Please login a checker first.")
+            await msg.reply_text("❌ Please login a checker first.")
             return
 
         if uid not in USER_QUEUES: USER_QUEUES[uid] = []
         if uid not in CHECKER_DUPLICATES: CHECKER_DUPLICATES[uid] = set()
             
-        bunch_msg_id = update.message.message_id
+        bunch_msg_id = msg.message_id
         added_count = duplicate_count = 0
 
         for l in links:
@@ -1919,9 +1948,9 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             else: duplicate_count += 1
 
         if added_count == 0 and duplicate_count > 0:
-            msg = await update.message.reply_text(f"⚠️ <b>Skipped!</b> All {duplicate_count} links were duplicates.", parse_mode="HTML")
+            notify_msg = await msg.reply_text(f"⚠️ <b>Skipped!</b> All {duplicate_count} links were duplicates.", parse_mode="HTML")
             await asyncio.sleep(3)
-            try: await msg.delete()
+            try: await notify_msg.delete()
             except: pass
             return
 
@@ -1929,9 +1958,9 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             msg_text = f"✅ Added {added_count} new links to Queue."
             if duplicate_count > 0: msg_text += f"\n🗑 Skipped {duplicate_count} duplicate links in current queue session."
             msg_text += f"\nTotal in Queue: {len(USER_QUEUES[uid])}"
-            msg = await update.message.reply_text(msg_text)
+            notify_msg = await msg.reply_text(msg_text)
             await asyncio.sleep(3)
-            try: await msg.delete()
+            try: await notify_msg.delete()
             except: pass
             return
 
@@ -1957,9 +1986,11 @@ def main():
     
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CallbackQueryHandler(on_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     
-    print(f"[{datetime.now()}] 🟢 Bot is running with Upgraded DUAL-ID Auto-Fallback Scraper...")
+    # Updated: ~filters.COMMAND makes sure it handles all incoming Channel Posts and Messages automatically!
+    app.add_handler(MessageHandler(~filters.COMMAND, on_message))
+    
+    print(f"[{datetime.now()}] 🟢 Bot is running with Upgraded DUAL-ID Auto-Fallback & Storage Fetcher...")
     
     app.run_polling(drop_pending_updates=True)
 
