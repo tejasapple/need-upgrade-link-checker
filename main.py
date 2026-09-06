@@ -196,7 +196,7 @@ def clean_html_text(text: str) -> str:
 
 def get_user_sessions(uid: int, session_type="checker") -> list:
     sessions = []
-    prefix = f"u{uid}_" if session_type == "checker" else f"scraper_{uid}_"
+    prefix = f"u{uid}_" if session_type == "checker" else f"{session_type}_{uid}_"
     try:
         for file in os.listdir(SESSIONS_DIR):
             if file.startswith(prefix) and file.endswith(".session"):
@@ -681,9 +681,9 @@ async def process_and_send_media(app, bot_uploader, msg, dest_id, cid, status_ms
     return success
 
 async def _run_media_extractor(uid: int, cid: int, target_link: str, mode: str, dest_id: int):
-    scraper_sessions = get_user_sessions(uid, "scraper")
-    if not scraper_sessions:
-        await _send_raw(cid, "❌ <b>No Scraper ID logged in!</b>\nPlease add an account in Link Pro -> Scraper Menu first.")
+    ext_sessions = get_user_sessions(uid, "extractor")
+    if not ext_sessions:
+        await _send_raw(cid, "❌ <b>No Extractor Account logged in!</b>\nPlease add an account in Media Extractor -> Manage Extractor Account first.")
         return
 
     chat_id, start_msg_id = parse_msg_link(target_link)
@@ -691,17 +691,17 @@ async def _run_media_extractor(uid: int, cid: int, target_link: str, mode: str, 
         await _send_raw(cid, "❌ <b>Invalid Post Link!</b>\nPlease provide a direct link to a message or bot (e.g., t.me/c/12345/67 or Bot Link)")
         return
 
-    app = Client(scraper_sessions[0], api_id=API_ID, api_hash=API_HASH, no_updates=True)
+    app = Client(ext_sessions[0], api_id=API_ID, api_hash=API_HASH, no_updates=True)
     
-    prog_resp = await _send_raw(cid, "🔄 <b>Connecting Scraper ID to extract media...</b>")
+    prog_resp = await _send_raw(cid, "🔄 <b>Connecting Extractor ID to extract media...</b>")
     status_msg_id = prog_resp.get("result", {}).get("message_id") if isinstance(prog_resp, dict) else None
 
     try:
         try:
             await app.connect()
         except AuthKeyUnregistered:
-            await _edit_raw(cid, status_msg_id, "❌ <b>Scraper Session Expired!</b>\nYour Scraper ID was logged out or revoked by Telegram. Please delete it and login again.")
-            try: os.remove(scraper_sessions[0] + ".session")
+            await _edit_raw(cid, status_msg_id, "❌ <b>Extractor Session Expired!</b>\nYour Extractor ID was logged out or revoked by Telegram. Please delete it and login again.")
+            try: os.remove(ext_sessions[0] + ".session")
             except: pass
             EXTRACTOR_TASKS[uid] = False
             return
@@ -714,7 +714,7 @@ async def _run_media_extractor(uid: int, cid: int, target_link: str, mode: str, 
         try:
             chat = await app.get_chat(chat_id)
         except Exception as e:
-            await _edit_raw(cid, status_msg_id, f"❌ <b>Scraper ID cannot access this chat!</b>\nError: {e}\n<i>Make sure the Scraper ID has joined the group/channel/bot.</i>")
+            await _edit_raw(cid, status_msg_id, f"❌ <b>Extractor ID cannot access this chat!</b>\nError: {e}\n<i>Make sure the Extractor ID has joined the group/channel/bot.</i>")
             return
 
         if "?start=" in target_link:
@@ -964,13 +964,12 @@ async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True, 
     
     checker_sessions = get_user_sessions(uid, "checker")
     
-    # 10 minutes delay logic before processing storage
     if checker_sessions and total_extracted > 0:
         msg_done += "🤖 <i>Auto-starting Link Processing Queue from Storage in 10 minutes...</i>\n*(If manually triggered, on_message will process it instantly)*"
         if manual: await _send_raw(cid, msg_done)
         
         async def delayed_bulk_check():
-            await asyncio.sleep(600)  # Wait exactly 10 minutes
+            await asyncio.sleep(600)
             if not CHECKING_LOCKS.get(uid):
                 CHECKING_LOCKS[uid] = True
                 asyncio.create_task(_run_bulk_check(uid, cid, checker_sessions, auto_storage=True))
@@ -984,7 +983,6 @@ async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True, 
         if manual: await _send_raw(cid, msg_done)
         
     SCRAPER_TASKS[uid] = "stopped"
-
 async def auto_scraper_loop():
     while True:
         try:
@@ -1353,8 +1351,10 @@ def PRO_KB(uid):
         [{"text": "🔙 Back", "callback_data": "back_start"}]
     ]
 
-def EXTRACTOR_KB():
+def EXTRACTOR_KB(uid):
+    ext_sessions = get_user_sessions(uid, "extractor")
     return [
+        [{"text": f"👤 Manage Extractor Account ({len(ext_sessions)} Active)", "callback_data": "menu_extractor_accounts"}],
         [{"text": "📌 Extract Single Post", "callback_data": "ext_single"}],
         [{"text": "📚 Extract Bulk (All below link)", "callback_data": "ext_bulk"}],
         [{"text": "⚙️ Set Target/Upload Channel", "callback_data": "menu_config_extractor"}],
@@ -1398,15 +1398,44 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     elif d == "menu_extractor_main":
         ctx.user_data["mode"] = ""
-        await _edit_raw(cid, mid, "🎥 <b>Restricted Media Extractor</b>\n\nUse this to download restricted media from Bots, Groups or Channels and upload them to your set Target Channel.\n\n<i>Requires Scraper ID to be logged in (via Link Pro menu).</i>", EXTRACTOR_KB())
+        await _edit_raw(cid, mid, "🎥 <b>Restricted Media Extractor</b>\n\nUse this to download restricted media from Bots, Groups or Channels and upload them to your set Target Channel.\n\n<i>Requires an Extractor ID to be logged in (via Manage Extractor Account menu).</i>", EXTRACTOR_KB(uid))
+
+    elif d == "menu_extractor_accounts":
+        sessions = get_user_sessions(uid, "extractor")
+        kb = [[{"text": "➕ Login Extractor ID", "callback_data": "login_new_ext"}]]
+        for s in sessions:
+            base_name = os.path.basename(s)
+            kb.append([{"text": f"🗑 Logout ID: {base_name}", "callback_data": f"logout_ext_{base_name}"}])
+        if len(sessions) > 1: kb.append([{"text": "🗑 Logout All Extractor IDs", "callback_data": "logout_all_ext"}])
+        kb.append([{"text": "🔙 Back", "callback_data": "menu_extractor_main"}])
+        await _edit_raw(cid, mid, f"👤 <b>Extractor Account Manager</b>\n\nLogged in Extractor IDs: <b>{len(sessions)}</b>\n\nExtractor Bot sirf in IDs ka use karega media nikalne ke liye.", kb)
+
+    elif d == "login_new_ext":
+        ctx.user_data["mode"] = "login_phone"
+        ctx.user_data["login_type"] = "extractor"
+        ctx.user_data["slot"] = get_next_slot(uid, "extractor")
+        await _edit_raw(cid, mid, "📱 Send your Telegram Phone Number for **Extractor ID** with country code.\nExample: <code>+919876543210</code>\n\n⚠️ <i>Note: OTP usually arrives in your main Telegram App messages.</i>", [[{"text": "🔙 Cancel", "callback_data": "menu_extractor_accounts"}]])
+
+    elif d.startswith("logout_ext_"):
+        session_name = d.replace("logout_ext_", "")
+        path = os.path.join(SESSIONS_DIR, session_name + ".session")
+        try: os.remove(path)
+        except: pass
+        await on_callback(Update(update.update_id, callback_query=update.callback_query._replace(data="menu_extractor_accounts")), ctx)
+
+    elif d == "logout_all_ext":
+        for s in get_user_sessions(uid, "extractor"):
+            try: os.remove(s + ".session")
+            except: pass
+        await _edit_raw(cid, mid, "✅ All Extractor IDs Logged Out.", [[{"text": "🔙 Back", "callback_data": "menu_extractor_accounts"}]])
 
     elif d == "ext_single":
         ctx.user_data["mode"] = "ext_single_wait"
-        await _edit_raw(cid, mid, "📌 <b>Single Post Extraction</b>\n\nSend the exact message link (e.g. `t.me/c/123456/789`).\n\n<i>Make sure your Scraper ID has joined the target group/bot!</i>", [[{"text": "🔙 Cancel", "callback_data": "menu_extractor_main"}]])
+        await _edit_raw(cid, mid, "📌 <b>Single Post Extraction</b>\n\nSend the exact message link (e.g. `t.me/c/123456/789`).\n\n<i>Make sure your Extractor ID has joined the target group/bot!</i>", [[{"text": "🔙 Cancel", "callback_data": "menu_extractor_main"}]])
 
     elif d == "ext_bulk":
         ctx.user_data["mode"] = "ext_bulk_wait"
-        await _edit_raw(cid, mid, "📚 <b>Bulk Post Extraction</b>\n\nSend the STARTING message link.\nBot will extract that message and ALL messages posted after it sequentially.\n\n<i>Make sure your Scraper ID has joined!</i>", [[{"text": "🔙 Cancel", "callback_data": "menu_extractor_main"}]])
+        await _edit_raw(cid, mid, "📚 <b>Bulk Post Extraction</b>\n\nSend the STARTING message link.\nBot will extract that message and ALL messages posted after it sequentially.\n\n<i>Make sure your Extractor ID has joined!</i>", [[{"text": "🔙 Cancel", "callback_data": "menu_extractor_main"}]])
 
     elif d == "menu_config_checker":
         kb = []
@@ -1858,6 +1887,8 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ltype = ctx.user_data.get("login_type", "checker")
             if ltype == "scraper":
                 s_name = f"scraper_{uid}_{ctx.user_data['slot']}"
+            elif ltype == "extractor":
+                s_name = f"extractor_{uid}_{ctx.user_data['slot']}"
             else:
                 s_name = f"u{uid}_{ctx.user_data['slot']}"
                 
@@ -1990,7 +2021,7 @@ def main():
     # Updated: ~filters.COMMAND makes sure it handles all incoming Channel Posts and Messages automatically!
     app.add_handler(MessageHandler(~filters.COMMAND, on_message))
     
-    print(f"[{datetime.now()}] 🟢 Bot is running with Upgraded DUAL-ID Auto-Fallback & Storage Fetcher...")
+    print(f"[{datetime.now()}] 🟢 Bot is running with Upgraded DUAL-ID Auto-Fallback, Storage Fetcher & Extractor Manager...")
     
     app.run_polling(drop_pending_updates=True)
 
