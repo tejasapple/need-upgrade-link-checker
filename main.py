@@ -228,23 +228,24 @@ def track_user(uid: int):
             with open(USERS_FILE, "a") as f: f.write(f"{uid}\n")
     except: pass
 
+# Upgraded Link Extractor Engine: Ensures no dots, missed formats, or trailing symbols
 def extract_links(text: str) -> list:
-    raw = re.findall(r"(?:https?://)?t\.me/(?:joinchat/|\+)?[a-zA-Z0-9_\-+]+", text)
+    raw = re.findall(r"(?:https?://)?(?:t\.me|telegram\.me|telegram\.dog)/(?:joinchat/|\+|c/)?[a-zA-Z0-9_\-+]+", text)
     out = []
     seen = set()
     for lnk in raw:
-        lnk = lnk.rstrip("-.,_ \n\t*`~")
+        lnk = lnk.rstrip("-.,_ \n\t*`~'\"")
         if not lnk.startswith("http"): lnk = "https://" + lnk
-        if lnk not in seen and "t.me/" in lnk:
+        if lnk not in seen:
             seen.add(lnk)
             out.append(lnk)
     return out
 
 def parse_link(link: str) -> tuple:
-    link = link.strip().rstrip("-.,_ \n\t*`~")
-    m = re.search(r"t\.me/(?:joinchat/|\+)([A-Za-z0-9_\-]+)", link)
+    link = link.strip().rstrip("-.,_ \n\t*`~'\"")
+    m = re.search(r"(?:t\.me|telegram\.me|telegram\.dog)/(?:joinchat/|\+)([A-Za-z0-9_\-]+)", link)
     if m: return True, m.group(1).rstrip("-")
-    m = re.search(r"t\.me/([a-zA-Z0-9_]+)", link)
+    m = re.search(r"(?:t\.me|telegram\.me|telegram\.dog)/([a-zA-Z0-9_]+)", link)
     if m: return False, m.group(1)
     return False, link
 
@@ -256,8 +257,8 @@ def parse_msg_link(link: str):
             chat_id = int("-100" + parts[0])
             msg_id = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 1
             return chat_id, msg_id
-        elif "t.me/" in link:
-            url_part = link.split("t.me/")[1]
+        elif "t.me/" in link or "telegram.me/" in link:
+            url_part = re.split(r"(?:t\.me/|telegram\.me/)", link)[1]
             parts = url_part.split("/")
             if parts[0] == "joinchat" or parts[0].startswith("+"):
                 return None, None
@@ -863,7 +864,7 @@ async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True, 
                         await asyncio.sleep(random.uniform(8.0, 15.0))
                     except UserAlreadyParticipant:
                         chat = await app.get_chat(chat_target)
-                elif isinstance(chat_target, str) and "t.me/" in chat_target:
+                elif isinstance(chat_target, str) and ("t.me/" in chat_target or "telegram.me/" in chat_target):
                     try:
                         if "/c/" in chat_target:
                             parts = chat_target.split("/c/")[1].split("/")
@@ -871,7 +872,7 @@ async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True, 
                                 chat_id = int("-100" + parts[0])
                                 chat = await app.get_chat(chat_id)
                         else:
-                            username = chat_target.split("t.me/")[1].split("/")[0].split("?")[0]
+                            username = re.split(r"(?:t\.me/|telegram\.me/)", chat_target)[1].split("/")[0].split("?")[0]
                             chat = await app.get_chat(username)
                     except Exception as e:
                         print(f"[{datetime.now()}] ⚠️ Link parsing error for target {target}: {e}")
@@ -897,6 +898,14 @@ async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True, 
                         
                     text = (msg.text or msg.caption or "")
                     links = extract_links(text)
+                    
+                    # EXTRACT LINKS FROM INLINE BUTTONS (NEW FIX)
+                    if msg.reply_markup and hasattr(msg.reply_markup, 'inline_keyboard'):
+                        for row in msg.reply_markup.inline_keyboard:
+                            for btn in row:
+                                if btn.url:
+                                    btn_links = extract_links(btn.url)
+                                    links.extend(btn_links)
                     
                     if links:
                         for l in links:
@@ -983,6 +992,7 @@ async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True, 
         if manual: await _send_raw(cid, msg_done)
         
     SCRAPER_TASKS[uid] = "stopped"
+
 async def auto_scraper_loop():
     while True:
         try:
@@ -996,7 +1006,6 @@ async def auto_scraper_loop():
                     
                     if state.get("auto_run", False):
                         last_run = state.get("last_run", 0)
-                        # Execute exactly every 8 hours (28800 seconds)
                         if (time.time() - last_run) >= 28800: 
                             if SCRAPER_TASKS.get(uid) != "running":
                                 print(f"[{datetime.now()}] 🔄 Starting Scheduled 8-Hour Auto-Scrape for UID: {uid}")
@@ -1007,7 +1016,7 @@ async def auto_scraper_loop():
         except Exception as e:
             logger.error(f"Auto Scraper Loop Error: {e}")
             
-        await asyncio.sleep(60) # Fast check every 1 minute to maintain strict 8 hours
+        await asyncio.sleep(60) 
 
 # ─────────────────────────────────────────
 #  NON-BLOCKING DASHBOARD UPDATER
@@ -1152,7 +1161,6 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False
                     fetched_msgs = []
                     messages_received = 0
                     try:
-                        # Fixed 00 bug: Fetch real unread history accurately
                         async for msg in PYRO_BOT.get_chat_history(get_conf("STORAGE_CHANNEL_ID"), limit=200):
                             if msg.id <= storage_last_msg_id:
                                 break
@@ -1162,11 +1170,19 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False
                         fetched_msg = None
                         
                         if fetched_msgs:
-                            fetched_msgs.reverse() # Start processing from oldest unread
+                            fetched_msgs.reverse() 
                             for msg in fetched_msgs:
                                 if not msg or msg.empty: continue
                                 messages_received += 1
-                                links = extract_links(msg.text or msg.caption or "")
+                                
+                                text = msg.text or msg.caption or ""
+                                links = extract_links(text)
+                                
+                                # NEW FIX: Extract links from inline buttons in Storage Channel
+                                if msg.reply_markup and hasattr(msg.reply_markup, 'inline_keyboard'):
+                                    for row in msg.reply_markup.inline_keyboard:
+                                        for btn in row:
+                                            if btn.url: links.extend(extract_links(btn.url))
                                 
                                 for l in links:
                                     if l not in CHECKER_DUPLICATES[uid]:
@@ -1694,7 +1710,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _edit_raw(cid, mid, f"🔗 <b>SEND LINKS NOW (MANUAL MODE)</b>\n\nSend up to unlimited links (Forward chunks smoothly).\nBot will process them securely using your {len(sessions)} logged-in IDs in the Account Bank.", [[{"text": "🔙 Back", "callback_data": "menu_pro"}]])
 
 # ─────────────────────────────────────────
-#  MESSAGE HANDLER (00 BUG & AUTO LISTENER FIXED)
+#  MESSAGE HANDLER (NEW FIX: AUTO STORAGE ROUTING)
 # ─────────────────────────────────────────
 async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.message or update.channel_post
@@ -1703,10 +1719,16 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cid = msg.chat.id
     text = (msg.text or msg.caption or "").strip()
     
-    # 1. Real-time Storage Channel Listener (Fixes Delay/Missing triggers)
+    # NEW FIX: Dynamically route Storage links to Admin queues so Dashboard appears in PM
     if msg.chat.type == "channel":
         if cid == get_conf("STORAGE_CHANNEL_ID"):
             links = extract_links(text)
+            
+            if msg.reply_markup and hasattr(msg.reply_markup, 'inline_keyboard'):
+                for row in msg.reply_markup.inline_keyboard:
+                    for btn in row:
+                        if btn.url: links.extend(extract_links(btn.url))
+                        
             if links:
                 uid = ADMIN_ID 
                 if uid not in USER_QUEUES: USER_QUEUES[uid] = []
@@ -1719,15 +1741,13 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         CHECKER_DUPLICATES[uid].add(l)
                         added_count += 1
                 
-                # Auto Start Queue without 10 mins delay directly on fresh storage drops
                 if added_count > 0 and not CHECKING_LOCKS.get(uid):
                     checker_sessions = get_user_sessions(uid, "checker")
                     if checker_sessions:
                         CHECKING_LOCKS[uid] = True
-                        asyncio.create_task(_run_bulk_check(uid, cid, checker_sessions, auto_storage=True))
+                        asyncio.create_task(_run_bulk_check(uid, uid, checker_sessions, auto_storage=True)) 
         return
 
-    # 2. Prevent Bot interacting with unwanted groups unnecessarily
     if msg.chat.type != "private" and msg.chat.type != "group" and msg.chat.type != "supergroup":
         return
 
@@ -2018,7 +2038,6 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CallbackQueryHandler(on_callback))
     
-    # Updated: ~filters.COMMAND makes sure it handles all incoming Channel Posts and Messages automatically!
     app.add_handler(MessageHandler(~filters.COMMAND, on_message))
     
     print(f"[{datetime.now()}] 🟢 Bot is running with Upgraded DUAL-ID Auto-Fallback, Storage Fetcher & Extractor Manager...")
