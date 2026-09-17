@@ -979,14 +979,16 @@ async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True, 
     checker_sessions = get_user_sessions(uid, "checker")
     
     if checker_sessions and total_extracted > 0:
-        msg_done += "🤖 <i>Auto-starting Link Processing Queue from Storage in 10 minutes...</i>\n*(If manually triggered, on_message will process it instantly)*"
+        # BUG FIX 1: Removed the 10-minute 600-second delay. Replaced with instant 5-second trigger.
+        msg_done += "🤖 <i>Auto-starting Link Processing Queue from Storage...</i>\n*(Processing instantly in background)*"
         if manual: await _send_raw(cid, msg_done)
         
         async def delayed_bulk_check():
-            await asyncio.sleep(600)
+            await asyncio.sleep(5)
             if not CHECKING_LOCKS.get(uid):
                 CHECKING_LOCKS[uid] = True
-                asyncio.create_task(_run_bulk_check(uid, cid, checker_sessions, auto_storage=True))
+                # Target ADMIN_ID directly for dashboard updates so it doesn't spam storage channel
+                asyncio.create_task(_run_bulk_check(uid, ADMIN_ID, checker_sessions, auto_storage=True))
                 
         asyncio.create_task(delayed_bulk_check())
     else:
@@ -2053,7 +2055,8 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CallbackQueryHandler(on_callback))
     
-    app.add_handler(MessageHandler(~filters.COMMAND, on_message))
+    # ── FIX: Added UpdateType.CHANNEL_POST so bot catches messages posted in Storage Channel ──
+    app.add_handler(MessageHandler(~filters.COMMAND & (filters.TEXT | filters.CAPTION), on_message))
     
     print(f"[{datetime.now()}] 🟢 Bot is running with Upgraded DUAL-ID Auto-Fallback, Storage Fetcher & Extractor Manager...")
     
