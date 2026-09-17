@@ -899,7 +899,6 @@ async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True, 
                     text = (msg.text or msg.caption or "")
                     links = extract_links(text)
                     
-                    # EXTRACT LINKS FROM INLINE BUTTONS (NEW FIX)
                     if msg.reply_markup and hasattr(msg.reply_markup, 'inline_keyboard'):
                         for row in msg.reply_markup.inline_keyboard:
                             for btn in row:
@@ -919,9 +918,15 @@ async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True, 
                     for i in range(0, len(chunk_links), 50): 
                         send_chunk = chunk_links[i:i+50]
                         text_to_send = "\n".join(send_chunk)
+                        
+                        # ── FIX: Use PYRO_BOT to send links to Storage so Pyrogram caches the Channel Peer ──
                         try:
-                            await _send_raw(get_conf("STORAGE_CHANNEL_ID"), text_to_send)
-                        except: pass
+                            await PYRO_BOT.send_message(get_conf("STORAGE_CHANNEL_ID"), text_to_send, disable_web_page_preview=True)
+                        except Exception as e:
+                            logger.error(f"PYRO_BOT send failed, fallback to HTTP: {e}")
+                            try: await _send_raw(get_conf("STORAGE_CHANNEL_ID"), text_to_send)
+                            except: pass
+                            
                         await asyncio.sleep(random.uniform(4.0, 8.0)) 
                 
                 if target_extracted == 0:
@@ -1092,7 +1097,6 @@ async def _update_dashboard_if_needed(uid: int, force=False):
         payload = {"chat_id": state["cid"], "message_id": state["dash_msg_id"], "text": dash_text, "parse_mode": "HTML", "disable_web_page_preview": True, "reply_markup": {"inline_keyboard": kb}}
         async with aiohttp.ClientSession() as s: await s.post(f"{TG_API}/editMessageText", json=payload)
     except: pass
-
 # ─────────────────────────────────────────
 #  BULK RUNNER WITH QUEUE (00 BUG FIXED: ROBUST STORAGE FETCH)
 # ─────────────────────────────────────────
@@ -1145,6 +1149,14 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False
 
     storage_last_msg_id = load_storage_state(uid) if auto_storage else 1
     empty_storage_batches = 0
+    
+    # FIX: DUMMY SYNC mechanism to resolve Pyrogram access_hash issue in no_updates mode
+    if auto_storage:
+        try:
+            dummy_msg = await PYRO_BOT.send_message(get_conf("STORAGE_CHANNEL_ID"), "🔄 <i>Syncing Channel Data...</i>", disable_notification=True)
+            await dummy_msg.delete()
+        except Exception as e:
+            logger.warning(f"Dummy sync failed (Bot may not be admin): {e}")
 
     while True:
         try:
@@ -1205,7 +1217,7 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False
                             empty_storage_batches += 1
                             
                     except Exception as e:
-                        logger.error(f"Storage Queue Error: {e}")
+                        logger.error(f"Storage Queue Error (Hint: Check Bot Admin Rights): {e}")
                         empty_storage_batches += 1
                     
                     if not USER_QUEUES.get(uid):
@@ -1519,6 +1531,9 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
             
         if uid in CHECKER_DUPLICATES: CHECKER_DUPLICATES[uid].clear()
+        
+        # FIX: Ensure storage checking actually starts from beginning when Force started.
+        save_storage_state(uid, 1)
         
         CHECKING_LOCKS[uid] = True
         asyncio.create_task(_run_bulk_check(uid, cid, sessions, auto_storage=True))
