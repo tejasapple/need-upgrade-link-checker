@@ -74,7 +74,8 @@ DEFAULT_CONFIG = {
     "MEMBERS_5000_PLUS_ID": -1004367240483,
     "ADD_MEMBER_TEXT_CHAT_ID": -1004334266609,
     "ADD_MEMBER_MEDIA_CHAT_ID": -1004334266609,
-    "EXTRACTOR_UPLOAD_ID": ADMIN_ID
+    "EXTRACTOR_UPLOAD_ID": ADMIN_ID,
+    "MEMBERSHIP_CHANNEL_ID": -1 # New Membership Channel
 }
 
 CONFIG_NAMES = {
@@ -90,7 +91,8 @@ CONFIG_NAMES = {
     "MEMBERS_5000_PLUS_ID": "Members 5000+",
     "ADD_MEMBER_TEXT_CHAT_ID": "Add Member + Text",
     "ADD_MEMBER_MEDIA_CHAT_ID": "Add Member + Media",
-    "EXTRACTOR_UPLOAD_ID": "Extractor Upload Target"
+    "EXTRACTOR_UPLOAD_ID": "Extractor Upload Target",
+    "MEMBERSHIP_CHANNEL_ID": "Membership Channel" # New Config Name
 }
 
 def load_bot_config():
@@ -138,13 +140,17 @@ EXTRACTOR_TASKS = {}
 #  JSON STATE LOADERS
 # ─────────────────────────────────────────
 def load_scraper_state(uid: int) -> dict:
-    default_state = {"targets_id1": {}, "targets_id2": {}, "auto_run": False, "last_run": 0, "daily_stats": 0}
+    default_state = {"auto_run": False, "last_run": 0, "daily_stats": 0}
+    for i in range(1, 7):
+        default_state[f"targets_id{i}"] = {}
+        
     try:
         if os.path.exists(SCRAPER_STATE_FILE):
             with open(SCRAPER_STATE_FILE, "r") as f:
                 data = json.load(f)
                 state = data.get(str(uid), default_state)
                 
+                # Migration for old targets
                 if "targets" in state:
                     if isinstance(state.get("targets"), list):
                         state["targets_id1"] = {str(t): 0 for t in state["targets"]}
@@ -152,8 +158,10 @@ def load_scraper_state(uid: int) -> dict:
                         state["targets_id1"] = state["targets"]
                     del state["targets"]
                 
-                if "targets_id1" not in state: state["targets_id1"] = {}
-                if "targets_id2" not in state: state["targets_id2"] = {}
+                # Ensure 1 to 6 target dictionaries exist
+                for i in range(1, 7):
+                    if f"targets_id{i}" not in state: state[f"targets_id{i}"] = {}
+                    
                 if "auto_run" not in state: state["auto_run"] = False
                 if "last_run" not in state: state["last_run"] = 0
                 if "daily_stats" not in state: state["daily_stats"] = 0
@@ -530,7 +538,7 @@ async def try_check_link(app: Client, link: str):
 #  INSTANT SENDER & ROUTING
 # ─────────────────────────────────────────
 async def _send_raw(chat_id: int, text: str, keyboard=None, retries=3):
-    if not chat_id or chat_id == 0: return False
+    if not chat_id or chat_id == 0 or chat_id == -1: return False
     payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True, "parse_mode": "HTML"}
     if keyboard: payload["reply_markup"] = {"inline_keyboard": keyboard}
     
@@ -570,6 +578,15 @@ async def dispatch_result(r: dict, stats_tracker: dict):
     if r["status"] == "active":
         await _send_raw(get_conf("ACTIVE_CHANNEL_ID"), f"<b>✅ ACTIVE LINK</b>\n━━━━━━━━━━\n{msg}")
         
+        # MEMBERSHIP CHANNEL LOGIC (UPGRADED)
+        mem_ch_id = get_conf("MEMBERSHIP_CHANNEL_ID")
+        if mem_ch_id and mem_ch_id != -1:
+            title_text = r.get('title', 'Unknown Group')
+            safe_title = html.escape(title_text)
+            link_text = r['link']
+            mem_msg = f"<b>{safe_title}</b>\n{link_text}"
+            await _send_raw(mem_ch_id, mem_msg)
+            
         if "✅" in r.get("forward", ""):
             stats_tracker["fwd"] += 1
             await _send_raw(get_conf("FORWARD_ON_CHANNEL_ID"), f"<b>✅ FORWARD ON LINK</b>\n━━━━━━━━━━\n{msg}")
@@ -803,32 +820,24 @@ async def _run_media_extractor(uid: int, cid: int, target_link: str, mode: str, 
         EXTRACTOR_TASKS[uid] = False
 
 # ─────────────────────────────────────────
-#  SCRAPER & AUTO-UPDATES (UPGRADED DUAL ID & DELAY LOGIC)
+#  SCRAPER & AUTO-UPDATES (UPGRADED 6-ID LOGIC)
 # ─────────────────────────────────────────
-async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True, scrape_choice="both"):
+async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True, scrape_choice="all"):
     scraper_sessions = get_user_sessions(uid, "scraper")
     if not scraper_sessions:
         if manual: await _send_raw(cid, "❌ No Scraper IDs logged in! Please add an account in Scraper Menu.")
         return
 
-    targets_1 = state.get("targets_id1", {})
-    targets_2 = state.get("targets_id2", {})
-    
-    if not targets_1 and not targets_2:
+    has_targets = any(state.get(f"targets_id{i}") for i in range(1, 7))
+    if not has_targets:
         if manual: await _send_raw(cid, "❌ No Targets set! Please Add Target first.")
         return
-
-    id1_path = next((s for s in scraper_sessions if s.endswith("_1")), None)
-    id2_path = next((s for s in scraper_sessions if s.endswith("_2")), None)
-    
-    if not id1_path and len(scraper_sessions) > 0: id1_path = scraper_sessions[0]
-    if not id2_path and len(scraper_sessions) > 1: id2_path = scraper_sessions[1]
 
     total_extracted = 0
     if uid not in SCRAPER_DUPLICATES: SCRAPER_DUPLICATES[uid] = set()
 
     if manual:
-        mode_str = "(Processing Both IDs with Auto-Fallback)" if scrape_choice == "both" else f"(Processing ONLY ID {scrape_choice})"
+        mode_str = "(Processing ALL 6 IDs)" if scrape_choice == "all" else f"(Processing ONLY ID {scrape_choice})"
         await _send_raw(cid, f"🔄 <b>Starting Deep Scrape...</b>\n<i>{mode_str}</i>")
 
     async def _scrape_core(app_path, t_dict):
@@ -919,7 +928,6 @@ async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True, 
                         send_chunk = chunk_links[i:i+50]
                         text_to_send = "\n".join(send_chunk)
                         
-                        # ── FIX: Use PYRO_BOT to send links to Storage so Pyrogram caches the Channel Peer ──
                         try:
                             await PYRO_BOT.send_message(get_conf("STORAGE_CHANNEL_ID"), text_to_send, disable_web_page_preview=True)
                         except Exception as e:
@@ -947,30 +955,31 @@ async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True, 
         
         return results
 
-    res1 = {}
-    res2 = {}
-
-    if scrape_choice in ["1", "both"]:
-        res1 = await _scrape_core(id1_path, targets_1)
-        for t, nid in res1.get("new_states", {}).items(): targets_1[t] = nid
-        
-    if scrape_choice in ["2", "both"]:
-        res2 = await _scrape_core(id2_path, targets_2)
-        for t, nid in res2.get("new_states", {}).items(): targets_2[t] = nid
-        
-    if scrape_choice == "both":
-        if res1.get("failed_targets") and id2_path:
-            res_fail1 = await _scrape_core(id2_path, res1["failed_targets"])
-            for t, nid in res_fail1.get("new_states", {}).items(): targets_1[t] = nid
-            
-        if res2.get("failed_targets") and id1_path:
-            res_fail2 = await _scrape_core(id1_path, res2["failed_targets"])
-            for t, nid in res_fail2.get("new_states", {}).items(): targets_2[t] = nid
+    # Process each scraper ID 1 to 6
+    for i in range(1, 7):
+        if scrape_choice in [str(i), "all"]:
+            t_dict = state.get(f"targets_id{i}", {})
+            if t_dict:
+                app_path = next((s for s in scraper_sessions if s.endswith(f"_{i}")), None)
+                if app_path:
+                    res = await _scrape_core(app_path, t_dict)
+                    for t, nid in res.get("new_states", {}).items(): 
+                        state[f"targets_id{i}"][t] = nid
+                        
+                    failed = res.get("failed_targets", {})
+                    if failed and scrape_choice == "all":
+                        # Basic Fallback: Try on the first alternative available ID
+                        alt_path = next((s for s in scraper_sessions if s != app_path), None)
+                        if alt_path:
+                            alt_res = await _scrape_core(alt_path, failed)
+                            for t, nid in alt_res.get("new_states", {}).items():
+                                state[f"targets_id{i}"][t] = nid
 
     state["last_run"] = time.time()
     state["daily_stats"] += total_extracted
-    state["targets_id1"] = targets_1
-    state["targets_id2"] = targets_2
+    for i in range(1, 7):
+        if f"targets_id{i}" not in state:
+            state[f"targets_id{i}"] = {}
     save_scraper_state(uid, state)
 
     print(f"[{datetime.now()}] ✅ Scraping completed! Total: {total_extracted}")
@@ -979,7 +988,6 @@ async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True, 
     checker_sessions = get_user_sessions(uid, "checker")
     
     if checker_sessions and total_extracted > 0:
-        # BUG FIX 1: Removed the 10-minute 600-second delay. Replaced with instant 5-second trigger.
         msg_done += "🤖 <i>Auto-starting Link Processing Queue from Storage...</i>\n*(Processing instantly in background)*"
         if manual: await _send_raw(cid, msg_done)
         
@@ -987,7 +995,6 @@ async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True, 
             await asyncio.sleep(5)
             if not CHECKING_LOCKS.get(uid):
                 CHECKING_LOCKS[uid] = True
-                # Target ADMIN_ID directly for dashboard updates so it doesn't spam storage channel
                 asyncio.create_task(_run_bulk_check(uid, ADMIN_ID, checker_sessions, auto_storage=True))
                 
         asyncio.create_task(delayed_bulk_check())
@@ -1017,13 +1024,64 @@ async def auto_scraper_loop():
                             if SCRAPER_TASKS.get(uid) != "running":
                                 print(f"[{datetime.now()}] 🔄 Starting Scheduled 8-Hour Auto-Scrape for UID: {uid}")
                                 SCRAPER_TASKS[uid] = "running"
-                                asyncio.create_task(_run_daily_scraper_task(uid, uid, state, manual=False, scrape_choice="both"))
+                                asyncio.create_task(_run_daily_scraper_task(uid, uid, state, manual=False, scrape_choice="all"))
         except asyncio.CancelledError:
             break
         except Exception as e:
             logger.error(f"Auto Scraper Loop Error: {e}")
             
         await asyncio.sleep(60) 
+
+# ─────────────────────────────────────────
+#  MEMBERSHIP 8-HOUR AUTO CLEANER (NEW FEATURE)
+# ─────────────────────────────────────────
+async def auto_membership_cleaner():
+    while True:
+        try:
+            mem_id = get_conf("MEMBERSHIP_CHANNEL_ID")
+            if mem_id and mem_id != -1:
+                print(f"[{datetime.now()}] 🧹 Running 8-Hour Membership Channel Cleanup...")
+                fetched_msgs = []
+                # Fetching last 200 messages
+                try:
+                    async for msg in PYRO_BOT.get_chat_history(mem_id, limit=200):
+                        fetched_msgs.append(msg)
+                except Exception as e:
+                    logger.error(f"Failed to fetch membership channel history: {e}")
+                    
+                for msg in fetched_msgs:
+                    if not msg.text and not msg.caption: continue
+                    text = msg.text or msg.caption
+                    
+                    if "<s>" in text or "LINK EXPIRED" in text:
+                        continue 
+                        
+                    links = extract_links(text)
+                    if not links: continue
+                    
+                    expired_found = False
+                    for lnk in links:
+                        # Checking ONLY using standard HTTP checker (No data storage)
+                        res = await check_public_via_http(lnk)
+                        if res.get("status") in ["expired", "error"]:
+                            expired_found = True
+                            break
+                        await asyncio.sleep(1)
+                        
+                    if expired_found:
+                        try:
+                            # Apply strict strike-through formatting using HTML
+                            safe_text = msg.text.html if hasattr(msg.text, 'html') else html.escape(text)
+                            new_text = f"<s>{safe_text}</s>\n\n❌ <b>(Expired)</b>"
+                            await PYRO_BOT.edit_message_text(mem_id, msg.id, new_text, disable_web_page_preview=True)
+                            await asyncio.sleep(2.5) # Anti-Flood delay
+                        except Exception as e:
+                            logger.error(f"Edit membership msg failed (ID: {msg.id}): {e}")
+        except Exception as e:
+            logger.error(f"Membership cleaner loop error: {e}")
+            
+        # Sleep for 8 Hours before next cleanup check
+        await asyncio.sleep(28800)
 
 # ─────────────────────────────────────────
 #  NON-BLOCKING DASHBOARD UPDATER
@@ -1099,6 +1157,7 @@ async def _update_dashboard_if_needed(uid: int, force=False):
         payload = {"chat_id": state["cid"], "message_id": state["dash_msg_id"], "text": dash_text, "parse_mode": "HTML", "disable_web_page_preview": True, "reply_markup": {"inline_keyboard": kb}}
         async with aiohttp.ClientSession() as s: await s.post(f"{TG_API}/editMessageText", json=payload)
     except: pass
+
 # ─────────────────────────────────────────
 #  BULK RUNNER WITH QUEUE (00 BUG FIXED: ROBUST STORAGE FETCH)
 # ─────────────────────────────────────────
@@ -1152,7 +1211,6 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False
     storage_last_msg_id = load_storage_state(uid) if auto_storage else 1
     empty_storage_batches = 0
     
-    # FIX: DUMMY SYNC mechanism to resolve Pyrogram access_hash issue in no_updates mode
     if auto_storage:
         try:
             dummy_msg = await PYRO_BOT.send_message(get_conf("STORAGE_CHANNEL_ID"), "🔄 <i>Syncing Channel Data...</i>", disable_notification=True)
@@ -1192,7 +1250,6 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False
                                 text = msg.text or msg.caption or ""
                                 links = extract_links(text)
                                 
-                                # NEW FIX: Extract links from inline buttons in Storage Channel
                                 if msg.reply_markup and hasattr(msg.reply_markup, 'inline_keyboard'):
                                     for row in msg.reply_markup.inline_keyboard:
                                         for btn in row:
@@ -1372,7 +1429,7 @@ def PRO_KB(uid):
     scraper_sessions = get_user_sessions(uid, "scraper")
     return [
         [{"text": f"🏦 Checker Bank ({len(checker_sessions)} Active)", "callback_data": "menu_accounts"}],
-        [{"text": f"🕷️ Scraper Accounts & Targets ({len(scraper_sessions)} Active)", "callback_data": "menu_scraper"}],
+        [{"text": f"🕷️ 6-ID Scraper & Targets ({len(scraper_sessions)} Active)", "callback_data": "menu_scraper"}],
         [{"text": "📥 Trigger Smart Scrape Now", "callback_data": "scraper_today"}],
         [{"text": "🚀 Force Start Storage (Ignore History)", "callback_data": "force_storage"}],
         [{"text": "🔗 Check Links (Manual Mode)", "callback_data": "menu_check"}],
@@ -1534,7 +1591,6 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             
         if uid in CHECKER_DUPLICATES: CHECKER_DUPLICATES[uid].clear()
         
-        # FIX: Ensure storage checking actually starts from beginning when Force started.
         save_storage_state(uid, 1)
         
         CHECKING_LOCKS[uid] = True
@@ -1546,43 +1602,44 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         scraper_sessions = get_user_sessions(uid, "scraper")
         auto_stat = "✅ ON (Every 8 Hrs)" if state.get("auto_run") else "❌ OFF"
         
-        targets_1 = state.get("targets_id1", {})
-        targets_2 = state.get("targets_id2", {})
+        kb = []
         
-        id1_active = any(s.endswith("_1") for s in scraper_sessions)
-        id2_active = any(s.endswith("_2") for s in scraper_sessions)
+        # Row 1: Login 1, 2, 3
+        row_log_1 = []
+        for i in range(1, 4):
+            id_act = any(s.endswith(f"_{i}") for s in scraper_sessions)
+            row_log_1.append({"text": f"➕ Login ID {i}" if not id_act else f"🗑 Logout ID {i}", "callback_data": f"login_s_{i}" if not id_act else f"logout_s_{i}"})
+        kb.append(row_log_1)
         
-        kb = [
-            [
-                {"text": "➕ Login ID 1" if not id1_active else "🗑 Logout ID 1", "callback_data": "login_s_1" if not id1_active else "logout_s_1"},
-                {"text": "➕ Login ID 2" if not id2_active else "🗑 Logout ID 2", "callback_data": "login_s_2" if not id2_active else "logout_s_2"}
-            ],
-            [
-                {"text": "🎯 Add Target (ID 1)", "callback_data": "scraper_add_target_1"},
-                {"text": "🗑 Rem Target (ID 1)", "callback_data": "scraper_rem_target_1"}
-            ],
-            [
-                {"text": "🎯 Add Target (ID 2)", "callback_data": "scraper_add_target_2"},
-                {"text": "🗑 Rem Target (ID 2)", "callback_data": "scraper_rem_target_2"}
-            ],
-            [{"text": f"🔄 8-Hour Auto-Scrape: {auto_stat}", "callback_data": "scraper_tog_auto"}],
-            [{"text": "🔙 Back", "callback_data": "menu_pro"}]
-        ]
+        # Row 2: Login 4, 5, 6
+        row_log_2 = []
+        for i in range(4, 7):
+            id_act = any(s.endswith(f"_{i}") for s in scraper_sessions)
+            row_log_2.append({"text": f"➕ Login ID {i}" if not id_act else f"🗑 Logout ID {i}", "callback_data": f"login_s_{i}" if not id_act else f"logout_s_{i}"})
+        kb.append(row_log_2)
         
-        t1_items = list(targets_1.items())[:15]
-        t1_list = "\n".join([f"• <code>{t}</code>" for t, m in t1_items]) if t1_items else "None"
-        if len(targets_1) > 15: t1_list += f"\n...and {len(targets_1)-15} more"
+        # Row 3: Add Target 1, 2, 3
+        kb.append([{"text": f"🎯 Add Target (ID {i})", "callback_data": f"scraper_add_target_{i}"} for i in range(1, 4)])
+        # Row 4: Add Target 4, 5, 6
+        kb.append([{"text": f"🎯 Add Target (ID {i})", "callback_data": f"scraper_add_target_{i}"} for i in range(4, 7)])
         
-        t2_items = list(targets_2.items())[:15]
-        t2_list = "\n".join([f"• <code>{t}</code>" for t, m in t2_items]) if t2_items else "None"
-        if len(targets_2) > 15: t2_list += f"\n...and {len(targets_2)-15} more"
+        # Row 5: Rem Target 1, 2, 3
+        kb.append([{"text": f"🗑 Rem Target (ID {i})", "callback_data": f"scraper_rem_target_{i}"} for i in range(1, 4)])
+        # Row 6: Rem Target 4, 5, 6
+        kb.append([{"text": f"🗑 Rem Target (ID {i})", "callback_data": f"scraper_rem_target_{i}"} for i in range(4, 7)])
+
+        kb.append([{"text": f"🔄 8-Hour Auto-Scrape: {auto_stat}", "callback_data": "scraper_tog_auto"}])
+        kb.append([{"text": "🔙 Back", "callback_data": "menu_pro"}])
         
+        t_list_text = ""
+        for i in range(1, 7):
+            t_dict = state.get(f"targets_id{i}", {})
+            if t_dict: t_list_text += f"🎯 <b>ID {i} Targets:</b> {len(t_dict)} channels\n"
+            
         text = (f"🕷️ <b>Scraper Accounts & Target Manager</b>\n\n"
-                f"👤 <b>Scraper ID 1:</b> {'✅ Logged In' if id1_active else '❌ Not Logged In'}\n"
-                f"🎯 <b>Targets (ID 1):</b>\n{t1_list}\n\n"
-                f"👤 <b>Scraper ID 2:</b> {'✅ Logged In' if id2_active else '❌ Not Logged In'}\n"
-                f"🎯 <b>Targets (ID 2):</b>\n{t2_list}\n\n"
-                f"<i>(Anti-Ban + Fallback System Active: Agar ID 1 में target scrape नहीं होता, तो ID 2 automatic check करेगा)</i>")
+                f"👤 <b>Active Scrapers:</b> {len(scraper_sessions)}/6\n\n"
+                f"<b>Assigned Targets:</b>\n{t_list_text if t_list_text else 'No targets assigned yet.'}\n\n"
+                f"<i>(You can now assign 6 different accounts to scrape from 6 different sets of channels without limits)</i>")
         await _edit_raw(cid, mid, text, kb)
 
     elif d == "scraper_tog_auto":
@@ -1641,12 +1698,16 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await _edit_raw(cid, mid, "⚠️ Scraper is already running!", [[{"text": "🔙 Back", "callback_data": "menu_pro"}]])
             return
         
-        kb = [
-            [{"text": "▶️ Scrape Only ID 1", "callback_data": "force_scrape_1"}],
-            [{"text": "▶️ Scrape Only ID 2", "callback_data": "force_scrape_2"}],
-            [{"text": "🔄 Scrape Both (Auto-Fallback)", "callback_data": "force_scrape_both"}],
-            [{"text": "🔙 Back", "callback_data": "menu_pro"}]
-        ]
+        kb = []
+        row = []
+        for i in range(1, 7):
+            row.append({"text": f"▶️ ID {i}", "callback_data": f"force_scrape_{i}"})
+            if len(row) == 3:
+                kb.append(row)
+                row = []
+        kb.append([{"text": "🔄 Scrape ALL (1 to 6)", "callback_data": "force_scrape_all"}])
+        kb.append([{"text": "🔙 Back", "callback_data": "menu_pro"}])
+        
         await _edit_raw(cid, mid, "📥 <b>Choose Scraper Mode</b>\n\nकौनसे Scraper ID से manual scraping start करनी है?", kb)
         
     elif d.startswith("force_scrape_"):
@@ -1661,12 +1722,10 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         asyncio.create_task(_run_daily_scraper_task(uid, cid, state, manual=True, scrape_choice=choice))
         
         msg_text = "✅ Initiating Smart Scrape...\n"
-        if choice == "1":
-            msg_text += "Extracting targets for <b>ID 1</b> only."
-        elif choice == "2":
-            msg_text += "Extracting targets for <b>ID 2</b> only."
+        if choice == "all":
+            msg_text += "Extracting all targets across <b>ALL 6 IDs</b>."
         else:
-            msg_text += "Extracting all target links across both IDs with Backup logic enabled."
+            msg_text += f"Extracting targets for <b>ID {choice}</b> only."
             
         await _edit_raw(cid, mid, msg_text, [[{"text": "🔙 Menu Pro", "callback_data": "menu_pro"}]])
 
@@ -1727,7 +1786,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _edit_raw(cid, mid, f"🔗 <b>SEND LINKS NOW (MANUAL MODE)</b>\n\nSend up to unlimited links (Forward chunks smoothly).\nBot will process them securely using your {len(sessions)} logged-in IDs in the Account Bank.", [[{"text": "🔙 Back", "callback_data": "menu_pro"}]])
 
 # ─────────────────────────────────────────
-#  MESSAGE HANDLER (NEW FIX: AUTO STORAGE ROUTING)
+#  MESSAGE HANDLER
 # ─────────────────────────────────────────
 async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.message or update.channel_post
@@ -1736,7 +1795,6 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cid = msg.chat.id
     text = (msg.text or msg.caption or "").strip()
     
-    # NEW FIX: Dynamically route Storage links to Admin queues so Dashboard appears in PM
     if msg.chat.type == "channel":
         if cid == get_conf("STORAGE_CHANNEL_ID"):
             links = extract_links(text)
@@ -1863,7 +1921,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         for chunk in all_chunks[1:]:
             await msg.reply_text(chunk, disable_web_page_preview=True, parse_mode="HTML")
 
-    elif mode in ["scraper_target_1", "scraper_target_2"]:
+    elif mode.startswith("scraper_target_"):
         slot = mode.split("_")[-1]
         target_val = None
         msg_id_to_save = 0
@@ -2047,7 +2105,11 @@ async def start_background_tasks(application: Application):
         print(f"[{datetime.now()}] ❌ Failed to start Global Pyrogram Bot: {e}")
 
     asyncio.create_task(auto_scraper_loop())
-    print(f"[{datetime.now()}] 🟢 Background Auto-Scraper Task Started Successfully!")
+    print(f"[{datetime.now()}] 🟢 Background Auto-Scraper Task (6-IDs) Started Successfully!")
+    
+    # NEW: Starts the 8-Hour Membership Cleaner Loop
+    asyncio.create_task(auto_membership_cleaner())
+    print(f"[{datetime.now()}] 🟢 8-Hour Membership Channel Cleaner Task Started Successfully!")
 
 def main():
     app = Application.builder().token(BOT_TOKEN).post_init(start_background_tasks).build()
@@ -2055,10 +2117,9 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CallbackQueryHandler(on_callback))
     
-    # ── FIX: Added UpdateType.CHANNEL_POST so bot catches messages posted in Storage Channel ──
     app.add_handler(MessageHandler(~filters.COMMAND & (filters.TEXT | filters.CAPTION), on_message))
     
-    print(f"[{datetime.now()}] 🟢 Bot is running with Upgraded DUAL-ID Auto-Fallback, Storage Fetcher & Extractor Manager...")
+    print(f"[{datetime.now()}] 🟢 Bot is running with Upgraded 6-ID Scraper, Storage Fetcher & Membership Channel Auto-Cleaner...")
     
     app.run_polling(drop_pending_updates=True)
 
