@@ -39,6 +39,7 @@ USERS_FILE = "users.txt"
 SCRAPER_STATE_FILE = "scraper_state.json"
 STORAGE_STATE_FILE = "storage_state.json"  
 CONFIG_FILE = "bot_config.json"
+MEMBERSHIP_DATA_FILE = "membership_daily.json"
 
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 
@@ -75,7 +76,7 @@ DEFAULT_CONFIG = {
     "ADD_MEMBER_TEXT_CHAT_ID": -1004334266609,
     "ADD_MEMBER_MEDIA_CHAT_ID": -1004334266609,
     "EXTRACTOR_UPLOAD_ID": ADMIN_ID,
-    "MEMBERSHIP_CHANNEL_ID": -1 # New Membership Channel
+    "MEMBERSHIP_CHANNEL_ID": -1 
 }
 
 CONFIG_NAMES = {
@@ -92,7 +93,7 @@ CONFIG_NAMES = {
     "ADD_MEMBER_TEXT_CHAT_ID": "Add Member + Text",
     "ADD_MEMBER_MEDIA_CHAT_ID": "Add Member + Media",
     "EXTRACTOR_UPLOAD_ID": "Extractor Upload Target",
-    "MEMBERSHIP_CHANNEL_ID": "Membership Channel" # New Config Name
+    "MEMBERSHIP_CHANNEL_ID": "Membership Channel" 
 }
 
 def load_bot_config():
@@ -150,7 +151,6 @@ def load_scraper_state(uid: int) -> dict:
                 data = json.load(f)
                 state = data.get(str(uid), default_state)
                 
-                # Migration for old targets
                 if "targets" in state:
                     if isinstance(state.get("targets"), list):
                         state["targets_id1"] = {str(t): 0 for t in state["targets"]}
@@ -158,7 +158,6 @@ def load_scraper_state(uid: int) -> dict:
                         state["targets_id1"] = state["targets"]
                     del state["targets"]
                 
-                # Ensure 1 to 6 target dictionaries exist
                 for i in range(1, 7):
                     if f"targets_id{i}" not in state: state[f"targets_id{i}"] = {}
                     
@@ -202,6 +201,15 @@ def clean_html_text(text: str) -> str:
     if not text: return "Unknown"
     return html.escape(str(text))
 
+def parse_count(val):
+    if isinstance(val, (int, float)): return int(val)
+    if isinstance(val, str):
+        val = val.upper().replace(',', '').replace(' ', '')
+        if 'K' in val: return int(float(val.replace('K', '')) * 1000)
+        if 'M' in val: return int(float(val.replace('M', '')) * 1000000)
+        if val.isdigit(): return int(val)
+    return 0
+
 def get_user_sessions(uid: int, session_type="checker") -> list:
     sessions = []
     prefix = f"u{uid}_" if session_type == "checker" else f"{session_type}_{uid}_"
@@ -236,7 +244,6 @@ def track_user(uid: int):
             with open(USERS_FILE, "a") as f: f.write(f"{uid}\n")
     except: pass
 
-# Upgraded Link Extractor Engine: Ensures no dots, missed formats, or trailing symbols
 def extract_links(text: str) -> list:
     raw = re.findall(r"(?:https?://)?(?:t\.me|telegram\.me|telegram\.dog)/(?:joinchat/|\+|c/)?[a-zA-Z0-9_\-+]+", text)
     out = []
@@ -572,6 +579,60 @@ def format_single_message(r: dict) -> str:
     else:
         return f"❌ <b>{r.get('title','Expired')}</b>\n👤 <b>Username:</b> {r.get('username')}\n⚠️ <b>Status:</b> <code>Expired</code>\n🔗 <b>Link:</b> {r['link']}\n"
 
+async def update_daily_membership_post(title, link):
+    mem_ch_id = get_conf("MEMBERSHIP_CHANNEL_ID")
+    if not mem_ch_id or mem_ch_id == -1: return
+    
+    today_str = datetime.now().strftime("%d %B")
+    
+    data = {"date": "", "msg_id": 0, "links": [], "part": 1}
+    if os.path.exists(MEMBERSHIP_DATA_FILE):
+        try:
+            with open(MEMBERSHIP_DATA_FILE, "r") as f:
+                data = json.load(f)
+        except: pass
+    
+    if data.get("date") != today_str:
+        data = {"date": today_str, "msg_id": 0, "links": [], "part": 1}
+    
+    if any(x['link'] == link for x in data["links"]):
+        return
+    
+    data["links"].append({"title": title, "link": link})
+    
+    part_str = f" (Part {data['part']})" if data.get("part", 1) > 1 else ""
+    text = f"<b>Updates for {today_str}{part_str}</b>\n\n"
+    
+    for idx, item in enumerate(data["links"], 1):
+        safe_title = html.escape(item['title'])
+        text += f"{idx}. <b>{safe_title}</b>\n{item['link']}\n"
+        
+    if len(text) > 3800:
+        data["part"] = data.get("part", 1) + 1
+        data["msg_id"] = 0
+        data["links"] = [{"title": title, "link": link}]
+        part_str = f" (Part {data['part']})"
+        text = f"<b>Updates for {today_str}{part_str}</b>\n\n1. <b>{html.escape(title)}</b>\n{link}\n"
+    
+    if data["msg_id"] == 0:
+        try:
+            msg = await PYRO_BOT.send_message(mem_ch_id, text, disable_web_page_preview=True)
+            data["msg_id"] = msg.id
+        except Exception as e:
+            logger.error(f"Failed to send daily membership post: {e}")
+    else:
+        try:
+            await PYRO_BOT.edit_message_text(mem_ch_id, data["msg_id"], text, disable_web_page_preview=True)
+        except Exception as e:
+            if "MESSAGE_ID_INVALID" in str(e).upper() or "DELETED" in str(e).upper() or "NOT_FOUND" in str(e).upper():
+                 msg = await PYRO_BOT.send_message(mem_ch_id, text, disable_web_page_preview=True)
+                 data["msg_id"] = msg.id
+                 
+    try:
+        with open(MEMBERSHIP_DATA_FILE, "w") as f:
+            json.dump(data, f)
+    except: pass
+
 async def dispatch_result(r: dict, stats_tracker: dict):
     msg = format_single_message(r)
     
@@ -581,11 +642,11 @@ async def dispatch_result(r: dict, stats_tracker: dict):
         # MEMBERSHIP CHANNEL LOGIC (UPGRADED)
         mem_ch_id = get_conf("MEMBERSHIP_CHANNEL_ID")
         if mem_ch_id and mem_ch_id != -1:
-            title_text = r.get('title', 'Unknown Group')
-            safe_title = html.escape(title_text)
-            link_text = r['link']
-            mem_msg = f"<b>{safe_title}</b>\n{link_text}"
-            await _send_raw(mem_ch_id, mem_msg)
+            v_count = parse_count(r.get('videos', '0'))
+            if v_count >= 200:
+                title_text = r.get('title', 'Unknown Group')
+                link_text = r['link']
+                await update_daily_membership_post(title_text, link_text)
             
         if "✅" in r.get("forward", ""):
             stats_tracker["fwd"] += 1
@@ -697,7 +758,6 @@ async def process_and_send_media(app, bot_uploader, msg, dest_id, cid, status_ms
         except: pass
         
     return success
-
 async def _run_media_extractor(uid: int, cid: int, target_link: str, mode: str, dest_id: int):
     ext_sessions = get_user_sessions(uid, "extractor")
     if not ext_sessions:
@@ -955,7 +1015,6 @@ async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True, 
         
         return results
 
-    # Process each scraper ID 1 to 6
     for i in range(1, 7):
         if scrape_choice in [str(i), "all"]:
             t_dict = state.get(f"targets_id{i}", {})
@@ -968,7 +1027,6 @@ async def _run_daily_scraper_task(uid: int, cid: int, state: dict, manual=True, 
                         
                     failed = res.get("failed_targets", {})
                     if failed and scrape_choice == "all":
-                        # Basic Fallback: Try on the first alternative available ID
                         alt_path = next((s for s in scraper_sessions if s != app_path), None)
                         if alt_path:
                             alt_res = await _scrape_core(alt_path, failed)
@@ -1033,7 +1091,7 @@ async def auto_scraper_loop():
         await asyncio.sleep(60) 
 
 # ─────────────────────────────────────────
-#  MEMBERSHIP 8-HOUR AUTO CLEANER (NEW FEATURE)
+#  MEMBERSHIP 8-HOUR AUTO CLEANER (UPGRADED)
 # ─────────────────────────────────────────
 async def auto_membership_cleaner():
     while True:
@@ -1042,39 +1100,53 @@ async def auto_membership_cleaner():
             if mem_id and mem_id != -1:
                 print(f"[{datetime.now()}] 🧹 Running 8-Hour Membership Channel Cleanup...")
                 fetched_msgs = []
-                # Fetching last 200 messages
+                
+                # Fetching messages to scan roughly the last 200 links
                 try:
-                    async for msg in PYRO_BOT.get_chat_history(mem_id, limit=200):
+                    async for msg in PYRO_BOT.get_chat_history(mem_id, limit=50):
                         fetched_msgs.append(msg)
                 except Exception as e:
                     logger.error(f"Failed to fetch membership channel history: {e}")
                     
+                links_checked = 0
                 for msg in fetched_msgs:
-                    if not msg.text and not msg.caption: continue
-                    text = msg.text or msg.caption
-                    
-                    if "<s>" in text or "LINK EXPIRED" in text:
-                        continue 
+                    if links_checked >= 200:
+                        break
                         
+                    if not msg.text and not msg.caption: continue
+                    
+                    # Get HTML formatted text to preserve existing styles
+                    text = msg.text.html if hasattr(msg.text, 'html') else (msg.text or msg.caption)
+                    
                     links = extract_links(text)
                     if not links: continue
                     
-                    expired_found = False
+                    msg_edited = False
+                    new_text = text
+                    
                     for lnk in links:
-                        # Checking ONLY using standard HTTP checker (No data storage)
-                        res = await check_public_via_http(lnk)
-                        if res.get("status") in ["expired", "error"]:
-                            expired_found = True
-                            break
-                        await asyncio.sleep(1)
+                        if links_checked >= 200: break
                         
-                    if expired_found:
+                        # Skip if already marked as expired
+                        if f"<s>{lnk}</s>" in new_text or "[Link Expired]" in new_text:
+                            links_checked += 1
+                            continue
+                            
+                        # Silent Background Check (HTTP Mode)
+                        res = await check_public_via_http(lnk)
+                        links_checked += 1
+                        
+                        if res.get("status") in ["expired", "error"]:
+                            # Inline replacing exact dead link with strikethrough logic
+                            new_text = new_text.replace(lnk, f"<s>{lnk} [Link Expired]</s>")
+                            msg_edited = True
+                            
+                        await asyncio.sleep(1) # Delay between link checks
+                        
+                    if msg_edited:
                         try:
-                            # Apply strict strike-through formatting using HTML
-                            safe_text = msg.text.html if hasattr(msg.text, 'html') else html.escape(text)
-                            new_text = f"<s>{safe_text}</s>\n\n❌ <b>(Expired)</b>"
                             await PYRO_BOT.edit_message_text(mem_id, msg.id, new_text, disable_web_page_preview=True)
-                            await asyncio.sleep(2.5) # Anti-Flood delay
+                            await asyncio.sleep(2.5) # Anti-Flood
                         except Exception as e:
                             logger.error(f"Edit membership msg failed (ID: {msg.id}): {e}")
         except Exception as e:
@@ -1159,7 +1231,7 @@ async def _update_dashboard_if_needed(uid: int, force=False):
     except: pass
 
 # ─────────────────────────────────────────
-#  BULK RUNNER WITH QUEUE (00 BUG FIXED: ROBUST STORAGE FETCH)
+#  BULK RUNNER WITH QUEUE (ROBUST STORAGE FETCH)
 # ─────────────────────────────────────────
 async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False):
     QUEUE_CONTROL[uid] = "running"
@@ -1604,28 +1676,22 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         
         kb = []
         
-        # Row 1: Login 1, 2, 3
         row_log_1 = []
         for i in range(1, 4):
             id_act = any(s.endswith(f"_{i}") for s in scraper_sessions)
             row_log_1.append({"text": f"➕ Login ID {i}" if not id_act else f"🗑 Logout ID {i}", "callback_data": f"login_s_{i}" if not id_act else f"logout_s_{i}"})
         kb.append(row_log_1)
         
-        # Row 2: Login 4, 5, 6
         row_log_2 = []
         for i in range(4, 7):
             id_act = any(s.endswith(f"_{i}") for s in scraper_sessions)
             row_log_2.append({"text": f"➕ Login ID {i}" if not id_act else f"🗑 Logout ID {i}", "callback_data": f"login_s_{i}" if not id_act else f"logout_s_{i}"})
         kb.append(row_log_2)
         
-        # Row 3: Add Target 1, 2, 3
         kb.append([{"text": f"🎯 Add Target (ID {i})", "callback_data": f"scraper_add_target_{i}"} for i in range(1, 4)])
-        # Row 4: Add Target 4, 5, 6
         kb.append([{"text": f"🎯 Add Target (ID {i})", "callback_data": f"scraper_add_target_{i}"} for i in range(4, 7)])
         
-        # Row 5: Rem Target 1, 2, 3
         kb.append([{"text": f"🗑 Rem Target (ID {i})", "callback_data": f"scraper_rem_target_{i}"} for i in range(1, 4)])
-        # Row 6: Rem Target 4, 5, 6
         kb.append([{"text": f"🗑 Rem Target (ID {i})", "callback_data": f"scraper_rem_target_{i}"} for i in range(4, 7)])
 
         kb.append([{"text": f"🔄 8-Hour Auto-Scrape: {auto_stat}", "callback_data": "scraper_tog_auto"}])
@@ -2107,7 +2173,7 @@ async def start_background_tasks(application: Application):
     asyncio.create_task(auto_scraper_loop())
     print(f"[{datetime.now()}] 🟢 Background Auto-Scraper Task (6-IDs) Started Successfully!")
     
-    # NEW: Starts the 8-Hour Membership Cleaner Loop
+    # Updated 8-Hour Membership Cleaner Loop Added Here
     asyncio.create_task(auto_membership_cleaner())
     print(f"[{datetime.now()}] 🟢 8-Hour Membership Channel Cleaner Task Started Successfully!")
 
