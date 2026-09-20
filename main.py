@@ -27,11 +27,11 @@ from pyrogram.raw.types import ChatInviteAlready, ChatInvite
 # ─────────────────────────────────────────
 #  CONFIG & INITIALIZATION
 # ─────────────────────────────────────────
-BOT_TOKEN = "8277915856:AAENwF3ByzZ7FKZ7CWLaxiVqCPtmgciEkQ4"
-API_ID    = 28980295
-API_HASH  = "c378a9631b9adaf795fe9562c95dbd24"
+BOT_TOKEN = ""
+API_ID    = 
+API_HASH  = ""
 
-ADMIN_ID  = 7121137252
+ADMIN_ID  = 
 
 # Directories and Files
 SESSIONS_DIR  = "sessions"
